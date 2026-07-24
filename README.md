@@ -117,7 +117,13 @@ phone, a VPN-only address, or `localhost` will not work.
    type `LIVE` and content type `audio/mpeg`.
 7. Start success is shown only after `MEDIA_STATUS` reports `PLAYING`.
 8. While playing, it retains the TLS and application channels, polls media
-   status every 30 seconds, and uses bounded-backoff recovery when needed.
+   status every 15 seconds, and uses bounded-backoff recovery when needed.
+
+Heartbeats are transmitted every five seconds, but a missing `PONG` alone does
+not tear down playback. Media-status timeouts retain the existing session and
+retry later; socket write/framing failures and explicit channel closure remain
+authoritative. This accommodates embedded Cast implementations that use
+receiver-originated heartbeats.
 
 Cast receivers use device-generated certificates on the local Cast port, so
 the firmware intentionally accepts the receiver's self-signed TLS certificate.

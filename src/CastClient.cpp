@@ -21,10 +21,9 @@ constexpr char kReceiverNamespace[] = "urn:x-cast:com.google.cast.receiver";
 constexpr char kMediaNamespace[] = "urn:x-cast:com.google.cast.media";
 
 constexpr uint32_t kHeartbeatIntervalMs = 5000;
-constexpr uint32_t kHeartbeatTimeoutMs = 20000;
 constexpr uint32_t kFrameCompletionTimeoutMs = 5000;
-constexpr uint32_t kMediaCheckIntervalMs = 30000;
-constexpr uint32_t kBufferingMaximumMs = 60000;
+constexpr uint32_t kMediaCheckIntervalMs = 15000;
+constexpr uint32_t kBufferingMaximumMs = 30000;
 constexpr uint32_t kRecoveryBaseDelayMs = 2000;
 constexpr uint32_t kRecoveryMaximumDelayMs = 30000;
 
@@ -43,8 +42,6 @@ CastClient::CastClient(StatusCallback statusCallback)
     : statusCallback_(statusCallback),
       requestId_((esp_random() & 0x3fffffffU) + 1),
       lastPingMs_(0),
-      pingOutstanding_(false),
-      pingOutstandingSinceMs_(0),
       maintainPlayback_(false),
       maintainedPort_(0),
       lastMediaCheckMs_(0),
@@ -598,6 +595,7 @@ void CastClient::scheduleRecovery(const String& reason) {
   mediaCheckPending_ = false;
   mediaCheckRequestId_ = 0;
   mediaCheckSentMs_ = 0;
+  bufferingSinceMs_ = 0;
 
   uint8_t shift = recoveryFailures_;
   if (shift > 4) {
@@ -648,13 +646,11 @@ bool CastClient::loadMaintainedStream() {
 
   report("Restarting OE3 stream");
   if (!sendPayload(maintainedApplication_.transportId, kMediaNamespace,
-                   payload) ||
-      !waitForLoadResult(loadRequestId, maintainedUrl_.c_str(), 25000)) {
+                   payload)) {
     return false;
   }
 
-  report("OE3 playback recovered");
-  recoveryFailures_ = 0;
+  report("OE3 restart requested");
   recoveryScheduled_ = false;
   recoveryScheduledAtMs_ = 0;
   recoveryDelayMs_ = 0;
@@ -744,10 +740,13 @@ bool CastClient::recoverMaintainedPlayback() {
 
       bool active = false;
       if (!waitForMediaActivity(mediaRequestId, 5000, active)) {
+        if (client_.connected()) {
+          report("Media state unavailable; requesting OE3");
+          succeeded = loadMaintainedStream();
+        }
         break;
       }
       if (active) {
-        recoveryFailures_ = 0;
         recoveryScheduled_ = false;
         recoveryScheduledAtMs_ = 0;
         recoveryDelayMs_ = 0;
@@ -858,19 +857,28 @@ void CastClient::service() {
         mediaCheckPending_) {
       JsonDocument mediaStatus;
       if (deserializeJson(mediaStatus, message.payloadUtf8)) {
-        scheduleRecovery("Invalid media health response");
-        return;
+        mediaCheckPending_ = false;
+        mediaCheckRequestId_ = 0;
+        mediaCheckSentMs_ = 0;
+        lastMediaCheckMs_ = millis();
+        report("Invalid media status; keeping Cast session");
+        continue;
       }
       const uint32_t responseRequestId = mediaStatus["requestId"] | 0U;
-      if (responseRequestId != mediaCheckRequestId_) {
+      if (responseRequestId != 0 &&
+          responseRequestId != mediaCheckRequestId_) {
         continue;
       }
 
       const char* type = mediaStatus["type"] | "";
       if (strcmp(type, "MEDIA_STATUS") != 0 ||
           !mediaStatus["status"].is<JsonArrayConst>()) {
-        scheduleRecovery("Media health response failed");
-        return;
+        mediaCheckPending_ = false;
+        mediaCheckRequestId_ = 0;
+        mediaCheckSentMs_ = 0;
+        lastMediaCheckMs_ = millis();
+        report("Media status rejected; keeping Cast session");
+        continue;
       }
 
       bool active = false;
@@ -879,9 +887,9 @@ void CastClient::service() {
         const char* state = status["playerState"] | "";
         const char* extendedState =
             status["extendedStatus"]["playerState"] | "";
-        if (strcmp(state, "PLAYING") == 0 ||
-            strcmp(state, "PAUSED") == 0) {
+        if (strcmp(state, "PLAYING") == 0) {
           bufferingSinceMs_ = 0;
+          recoveryFailures_ = 0;
           active = true;
           break;
         }
@@ -910,7 +918,11 @@ void CastClient::service() {
 
   if (mediaCheckPending_) {
     if (millis() - mediaCheckSentMs_ >= 5000) {
-      scheduleRecovery("Media status timed out");
+      mediaCheckPending_ = false;
+      mediaCheckRequestId_ = 0;
+      mediaCheckSentMs_ = 0;
+      lastMediaCheckMs_ = millis();
+      report("Media status delayed; keeping Cast session");
     }
     return;
   }
@@ -934,8 +946,11 @@ void CastClient::service() {
   }
   String payload;
   if (mediaRequest.overflowed() ||
-      serializeJson(mediaRequest, payload) == 0 ||
-      !sendPayload(maintainedApplication_.transportId, kMediaNamespace,
+      serializeJson(mediaRequest, payload) == 0) {
+    report("Could not build media health check");
+    return;
+  }
+  if (!sendPayload(maintainedApplication_.transportId, kMediaNamespace,
                    payload)) {
     scheduleRecovery("Media health check failed");
     return;
@@ -960,8 +975,6 @@ bool CastClient::open(const IPAddress& address, uint16_t port) {
 
     if (client_.connect(address, port)) {
       lastPingMs_ = millis();
-      pingOutstanding_ = false;
-      pingOutstandingSinceMs_ = 0;
       return true;
     }
 
@@ -1483,7 +1496,8 @@ bool CastClient::waitForMediaActivity(uint32_t expectedRequestId,
     }
 
     const uint32_t responseRequestId = document["requestId"] | 0U;
-    if (responseRequestId != expectedRequestId) {
+    if (responseRequestId != 0 &&
+        responseRequestId != expectedRequestId) {
       continue;
     }
 
@@ -1498,8 +1512,7 @@ bool CastClient::waitForMediaActivity(uint32_t expectedRequestId,
         const char* state = status["playerState"] | "";
         const char* extendedState =
             status["extendedStatus"]["playerState"] | "";
-        if (strcmp(state, "PLAYING") == 0 ||
-            strcmp(state, "PAUSED") == 0) {
+        if (strcmp(state, "PLAYING") == 0) {
           bufferingSinceMs_ = 0;
           active = true;
           break;
@@ -1542,10 +1555,6 @@ bool CastClient::handleHeartbeat(const cast_protocol::Message& message) {
   }
 
   const char* type = document["type"] | "";
-  if (strcmp(type, "PONG") == 0) {
-    pingOutstanding_ = false;
-    pingOutstandingSinceMs_ = 0;
-  }
   if (strcmp(type, "PING") == 0) {
     const String destination =
         message.sourceId.empty() ? String(kPlatformDestinationId)
@@ -1559,19 +1568,10 @@ bool CastClient::handleHeartbeat(const cast_protocol::Message& message) {
 }
 
 bool CastClient::maintainHeartbeat() {
-  if (pingOutstanding_ &&
-      millis() - pingOutstandingSinceMs_ >= kHeartbeatTimeoutMs &&
-      client_.available() <= 0) {
-    setError("Cast heartbeat timed out");
-    return false;
-  }
   return sendHeartbeatIfDue();
 }
 
 bool CastClient::sendHeartbeatIfDue() {
-  if (pingOutstanding_) {
-    return true;
-  }
   if (millis() - lastPingMs_ < kHeartbeatIntervalMs) {
     return true;
   }
@@ -1581,8 +1581,6 @@ bool CastClient::sendHeartbeatIfDue() {
     return false;
   }
   lastPingMs_ = millis();
-  pingOutstanding_ = true;
-  pingOutstandingSinceMs_ = lastPingMs_;
   return true;
 }
 

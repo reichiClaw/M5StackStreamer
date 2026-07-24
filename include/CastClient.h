@@ -99,8 +99,6 @@ class CastClient {
   String lastError_;
   uint32_t requestId_;
   uint32_t lastPingMs_;
-  bool pingOutstanding_;
-  uint32_t pingOutstandingSinceMs_;
 
   bool maintainPlayback_;
   IPAddress maintainedAddress_;
