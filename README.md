@@ -18,6 +18,8 @@ http://orf-live.ors-shoutcast.at/oe3-q2a
   other Cast V2 receivers through `_googlecast._tcp` mDNS.
 - Lets you select a receiver on the M5Stack display, including names containing
   `Ä`, `Ö`, `Ü`, `ä`, `ö`, `ü`, and `ß`.
+- Uses an Ö3-branded card interface with receiver and status icons, colored
+  controls, Wi-Fi state, and an animated on-air equalizer.
 - Launches the Default Media Receiver and loads OE3 as a live `audio/mpeg`
   source.
 - Uses the middle button as a remote-state start/stop toggle.
@@ -117,3 +119,10 @@ Only use the controller on a trusted LAN.
 
 Google does not publish Cast V2 as a supported embedded-controller API.
 Protocol changes in future receiver firmware could require a firmware update.
+
+## Logo artwork
+
+The compact two-color logo in `include/Oe3Logo.h` is derived from
+[Hitradio Ö3.svg on Wikimedia Commons](https://commons.wikimedia.org/wiki/File:Hitradio_%C3%963.svg).
+The source is a public-domain text logo; Hitradio Ö3 and its marks remain the
+property of their respective owner.

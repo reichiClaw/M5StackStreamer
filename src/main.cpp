@@ -9,6 +9,7 @@
 
 #include "AppConfig.h"
 #include "CastClient.h"
+#include "Oe3Logo.h"
 #include "TextEncoding.h"
 
 namespace {
@@ -19,6 +20,23 @@ struct CastDevice {
   uint16_t port;
 };
 
+enum class UiPlaybackState { kUnknown, kPlaying, kStopped };
+enum class StatusVisual { kReady, kBusy, kPlaying, kStopped, kError };
+
+constexpr uint16_t rgb565(uint8_t red, uint8_t green, uint8_t blue) {
+  return static_cast<uint16_t>(((red & 0xf8) << 8) |
+                               ((green & 0xfc) << 3) | (blue >> 3));
+}
+
+constexpr uint16_t kBackground = rgb565(4, 9, 18);
+constexpr uint16_t kCard = rgb565(10, 20, 35);
+constexpr uint16_t kCardBorder = rgb565(25, 45, 68);
+constexpr uint16_t kMuted = rgb565(132, 151, 177);
+constexpr uint16_t kOe3Blue = rgb565(1, 35, 80);
+constexpr uint16_t kOe3Red = rgb565(228, 28, 42);
+constexpr uint16_t kGreen = rgb565(36, 201, 123);
+constexpr uint16_t kAmber = rgb565(245, 166, 35);
+
 std::vector<CastDevice> devices;
 size_t selectedDevice = 0;
 String statusText = "Starting";
@@ -28,6 +46,8 @@ String hostName;
 bool mdnsStarted = false;
 uint32_t lastScanMs = 0;
 uint32_t wifiLostAtMs = 0;
+uint32_t lastEqualizerDrawMs = 0;
+UiPlaybackState playbackState = UiPlaybackState::kUnknown;
 
 String shortened(const String& value, size_t maximumCharacters) {
   if (value.length() <= maximumCharacters) {
@@ -64,112 +84,286 @@ void drawWrappedText(const String& text,
   }
 }
 
-void drawMainScreen() {
-  M5.Display.startWrite();
-  M5.Display.setAttribute(lgfx::UTF8_SWITCH, true);
-  M5.Display.cp437(false);
-  M5.Display.fillScreen(TFT_BLACK);
-  M5.Display.fillRect(0, 0, M5.Display.width(), 31, TFT_NAVY);
-  M5.Display.setTextColor(TFT_WHITE, TFT_NAVY);
-  M5.Display.setTextSize(2);
-  M5.Display.setCursor(8, 8);
-  M5.Display.print("M5 OE3 CAST");
+void drawLogoRuns(int32_t x,
+                  int32_t y,
+                  const oe3_logo::Run* runs,
+                  size_t runCount,
+                  uint16_t color) {
+  for (size_t index = 0; index < runCount; ++index) {
+    oe3_logo::Run run;
+    memcpy_P(&run, &runs[index], sizeof(run));
+    M5.Display.drawFastHLine(x + run.x, y + run.y, run.length, color);
+  }
+}
 
-  M5.Display.setTextSize(1);
-  M5.Display.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-  M5.Display.setCursor(8, 39);
-  if (WiFi.status() == WL_CONNECTED) {
-    M5.Display.printf("WiFi: %s  %s",
-                      shortened(WiFi.SSID(), 24).c_str(),
-                      WiFi.localIP().toString().c_str());
-  } else {
-    M5.Display.print("WiFi: disconnected");
+void drawOe3Logo(int32_t x, int32_t y) {
+  drawLogoRuns(x, y, oe3_logo::kBlueRuns, oe3_logo::kBlueRunCount,
+               kOe3Blue);
+  drawLogoRuns(x, y, oe3_logo::kRedRuns, oe3_logo::kRedRunCount,
+               kOe3Red);
+}
+
+StatusVisual statusVisual() {
+  String normalized = statusText;
+  normalized.toLowerCase();
+  if (normalized.indexOf("error") >= 0 ||
+      normalized.indexOf("failed") >= 0 ||
+      normalized.indexOf("could not") >= 0 ||
+      normalized.indexOf("did not") >= 0 ||
+      normalized.indexOf("unavailable") >= 0 ||
+      normalized.indexOf("not connected") >= 0 ||
+      normalized.indexOf("no cast receiver") >= 0 ||
+      normalized.indexOf("no receiver") >= 0) {
+    return StatusVisual::kError;
+  }
+  if (normalized.indexOf("playing") >= 0) {
+    return StatusVisual::kPlaying;
+  }
+  if (normalized.indexOf("stopped") >= 0) {
+    return StatusVisual::kStopped;
+  }
+  if (normalized.indexOf("connecting") >= 0 ||
+      normalized.indexOf("checking") >= 0 ||
+      normalized.indexOf("scanning") >= 0 ||
+      normalized.indexOf("starting") >= 0 ||
+      normalized.indexOf("opening") >= 0 ||
+      normalized.indexOf("sending") >= 0 ||
+      normalized.indexOf("buffering") >= 0 ||
+      normalized.indexOf("stopping") >= 0) {
+    return StatusVisual::kBusy;
+  }
+  return StatusVisual::kReady;
+}
+
+void drawStatusIcon(int32_t x, int32_t y, StatusVisual visual) {
+  uint16_t color = kOe3Blue;
+  if (visual == StatusVisual::kPlaying) {
+    color = kGreen;
+  } else if (visual == StatusVisual::kBusy) {
+    color = kAmber;
+  } else if (visual == StatusVisual::kError) {
+    color = kOe3Red;
+  } else if (visual == StatusVisual::kStopped) {
+    color = kMuted;
   }
 
-  M5.Display.setTextColor(TFT_CYAN, TFT_BLACK);
-  M5.Display.setCursor(8, 62);
-  M5.Display.print("CAST RECEIVER");
-  M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
-  M5.Display.setTextSize(2);
-  M5.Display.setCursor(8, 77);
-  if (devices.empty()) {
-    M5.Display.print("No receiver found");
+  M5.Display.fillCircle(x, y, 18, color);
+  if (visual == StatusVisual::kPlaying) {
+    M5.Display.fillTriangle(x - 4, y - 8, x - 4, y + 8, x + 9, y,
+                            TFT_WHITE);
+  } else if (visual == StatusVisual::kStopped) {
+    M5.Display.fillRoundRect(x - 6, y - 6, 12, 12, 2, TFT_WHITE);
+  } else if (visual == StatusVisual::kError) {
+    M5.Display.fillRect(x - 2, y - 9, 4, 12, TFT_WHITE);
+    M5.Display.fillCircle(x, y + 8, 2, TFT_WHITE);
+  } else if (visual == StatusVisual::kBusy) {
+    M5.Display.drawCircle(x, y, 9, TFT_WHITE);
+    M5.Display.fillCircle(x + 7, y - 6, 3, TFT_WHITE);
   } else {
+    M5.Display.drawLine(x - 8, y, x - 2, y + 6, TFT_WHITE);
+    M5.Display.drawLine(x - 2, y + 6, x + 9, y - 7, TFT_WHITE);
+  }
+}
+
+void drawEqualizer() {
+  static const uint8_t levels[4][7] = {
+      {9, 23, 15, 31, 18, 26, 11},
+      {18, 11, 29, 17, 32, 14, 24},
+      {27, 17, 10, 26, 15, 31, 18},
+      {13, 30, 20, 11, 25, 17, 29},
+  };
+
+  M5.Display.fillRect(12, 134, 74, 46, kCard);
+  const uint8_t frame = (millis() / 180) % 4;
+  for (uint8_t index = 0; index < 7; ++index) {
+    const uint8_t height =
+        playbackState == UiPlaybackState::kPlaying ? levels[frame][index] : 4;
+    const uint16_t color =
+        playbackState == UiPlaybackState::kPlaying
+            ? (index == 2 || index == 4 ? kOe3Red : kOe3Blue)
+            : kCardBorder;
+    M5.Display.fillRoundRect(15 + index * 10, 178 - height, 6, height, 2,
+                             color);
+  }
+}
+
+void drawButton(int32_t x,
+                uint16_t fillColor,
+                const char* key,
+                const char* label) {
+  constexpr int32_t y = 198;
+  constexpr int32_t width = 100;
+  constexpr int32_t height = 36;
+  M5.Display.fillRoundRect(x, y, width, height, 7, fillColor);
+  M5.Display.drawRoundRect(x, y, width, height, 7, kCardBorder);
+  M5.Display.fillCircle(x + 17, y + 18, 10, kBackground);
+  M5.Display.setTextColor(TFT_WHITE, kBackground);
+  M5.Display.setTextSize(1);
+  M5.Display.setCursor(x + 14, y + 14);
+  M5.Display.print(key);
+  M5.Display.setTextColor(TFT_WHITE, fillColor);
+  M5.Display.setCursor(x + 33, y + 14);
+  M5.Display.print(label);
+}
+
+void drawMainScreen() {
+  M5.Display.startWrite();
+  M5.Display.setFont(&fonts::Font0);
+  M5.Display.setAttribute(lgfx::UTF8_SWITCH, true);
+  M5.Display.cp437(false);
+  M5.Display.fillScreen(kBackground);
+
+  M5.Display.fillRoundRect(6, 6, 86, 184, 10, kCard);
+  M5.Display.drawRoundRect(6, 6, 86, 184, 10, kCardBorder);
+  drawOe3Logo(10, 11);
+
+  M5.Display.fillCircle(15, 91, 4,
+                        WiFi.status() == WL_CONNECTED ? kGreen : kOe3Red);
+  M5.Display.setTextSize(1);
+  M5.Display.setTextColor(kMuted, kCard);
+  M5.Display.setCursor(24, 88);
+  if (WiFi.status() == WL_CONNECTED) {
     M5.Display.setAttribute(lgfx::UTF8_SWITCH, false);
     M5.Display.cp437(true);
-    M5.Display.print(
-        shortened(textForDisplay(devices[selectedDevice].name), 25));
+    M5.Display.print(shortened(textForDisplay(WiFi.SSID()), 10));
+    M5.Display.setAttribute(lgfx::UTF8_SWITCH, true);
+    M5.Display.cp437(false);
+  } else {
+    M5.Display.print("OFFLINE");
+  }
+  M5.Display.drawFastHLine(13, 106, 72, kCardBorder);
+
+  const bool isPlaying = playbackState == UiPlaybackState::kPlaying;
+  M5.Display.fillRoundRect(14, 113, 70, 17, 8,
+                           isPlaying ? kOe3Red : kCardBorder);
+  M5.Display.setTextColor(TFT_WHITE, isPlaying ? kOe3Red : kCardBorder);
+  M5.Display.setCursor(isPlaying ? 29 : 24, 118);
+  M5.Display.print(isPlaying ? "ON AIR" : "LIVE RADIO");
+  drawEqualizer();
+
+  M5.Display.fillRoundRect(98, 6, 216, 84, 10, kCard);
+  M5.Display.drawRoundRect(98, 6, 216, 84, 10, kCardBorder);
+  M5.Display.fillRoundRect(109, 16, 15, 11, 2, kOe3Blue);
+  M5.Display.fillCircle(112, 24, 2, TFT_WHITE);
+  M5.Display.drawLine(112, 24, 119, 17, TFT_WHITE);
+  M5.Display.setTextColor(kMuted, kCard);
+  M5.Display.setTextSize(1);
+  M5.Display.setCursor(131, 18);
+  M5.Display.print("CAST RECEIVER");
+  M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+
+  if (devices.empty()) {
+    M5.Display.setTextColor(TFT_WHITE, kCard);
+    M5.Display.setTextSize(2);
+    M5.Display.setCursor(109, 39);
+    M5.Display.print("No receiver");
+  } else {
+    const String displayName = textForDisplay(devices[selectedDevice].name);
+    M5.Display.setAttribute(lgfx::UTF8_SWITCH, false);
+    M5.Display.cp437(true);
+    M5.Display.setTextColor(TFT_WHITE, kCard);
+    if (displayName.length() <= 16) {
+      M5.Display.setTextSize(2);
+      M5.Display.setCursor(109, 37);
+      M5.Display.print(displayName);
+    } else {
+      M5.Display.setTextSize(1);
+      M5.Display.setCursor(109, 42);
+      M5.Display.print(shortened(displayName, 31));
+    }
     M5.Display.setAttribute(lgfx::UTF8_SWITCH, true);
     M5.Display.cp437(false);
     M5.Display.setTextSize(1);
-    M5.Display.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-    M5.Display.setCursor(8, 101);
-    M5.Display.printf("%s:%u  (%u/%u)",
+    M5.Display.setTextColor(kMuted, kCard);
+    M5.Display.setCursor(109, 69);
+    M5.Display.printf("%s:%u",
                       devices[selectedDevice].address.toString().c_str(),
-                      devices[selectedDevice].port,
-                      static_cast<unsigned int>(selectedDevice + 1),
+                      devices[selectedDevice].port);
+    M5.Display.fillRoundRect(269, 64, 36, 16, 8, kOe3Blue);
+    M5.Display.setTextColor(TFT_WHITE, kOe3Blue);
+    M5.Display.setCursor(272, 69);
+    M5.Display.printf("%u/%u", static_cast<unsigned int>(selectedDevice + 1),
                       static_cast<unsigned int>(devices.size()));
   }
 
+  M5.Display.fillRoundRect(98, 96, 216, 94, 10, kCard);
+  M5.Display.drawRoundRect(98, 96, 216, 94, 10, kCardBorder);
   M5.Display.setTextSize(1);
-  M5.Display.setTextColor(TFT_CYAN, TFT_BLACK);
-  M5.Display.setCursor(8, 126);
+  M5.Display.setTextColor(kMuted, kCard);
+  M5.Display.setCursor(109, 106);
   M5.Display.print("STATUS");
+  drawStatusIcon(120, 146, statusVisual());
+
   M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
   M5.Display.setAttribute(lgfx::UTF8_SWITCH, false);
   M5.Display.cp437(true);
-  drawWrappedText(textForDisplay(statusText), 8, 142, 50, 5);
+  M5.Display.setTextColor(TFT_WHITE, kCard);
+  drawWrappedText(textForDisplay(statusText), 145, 126, 26, 5);
   M5.Display.setAttribute(lgfx::UTF8_SWITCH, true);
   M5.Display.cp437(false);
 
-  const int32_t buttonTop = M5.Display.height() - 30;
-  const int32_t third = M5.Display.width() / 3;
-  M5.Display.fillRect(0, buttonTop, M5.Display.width(), 30, TFT_DARKGREY);
-  M5.Display.drawFastVLine(third, buttonTop, 30, TFT_BLACK);
-  M5.Display.drawFastVLine(third * 2, buttonTop, 30, TFT_BLACK);
-  M5.Display.setTextColor(TFT_WHITE, TFT_DARKGREY);
-  M5.Display.setTextSize(1);
-  M5.Display.setCursor(37, buttonTop + 11);
-  M5.Display.print("NEXT");
-  M5.Display.setCursor(third + 17, buttonTop + 11);
-  M5.Display.print("START / STOP");
-  M5.Display.setCursor(third * 2 + 38, buttonTop + 11);
-  M5.Display.print("SCAN");
+  drawButton(4, kCard, "A", "NEXT");
+  drawButton(110, kOe3Red, "B", "START/STOP");
+  drawButton(216, kOe3Blue, "C", "SCAN");
   M5.Display.endWrite();
+  lastEqualizerDrawMs = millis();
 }
 
 void updateCastStatus(const String& message) {
   statusText = message;
+  String normalized = message;
+  normalized.toLowerCase();
+  if (normalized.indexOf("is playing") >= 0) {
+    playbackState = UiPlaybackState::kPlaying;
+  } else if (normalized.indexOf("stream is stopped") >= 0 ||
+             normalized.indexOf("already stopped") >= 0) {
+    playbackState = UiPlaybackState::kStopped;
+  }
   drawMainScreen();
 }
 
 void drawConfigPortal(WiFiManager*) {
   M5.Display.startWrite();
-  M5.Display.fillScreen(TFT_BLACK);
-  M5.Display.fillRect(0, 0, M5.Display.width(), 31, TFT_ORANGE);
-  M5.Display.setTextColor(TFT_BLACK, TFT_ORANGE);
+  M5.Display.setFont(&fonts::Font0);
+  M5.Display.fillScreen(kBackground);
+  M5.Display.fillRoundRect(6, 6, 86, 80, 10, kCard);
+  M5.Display.drawRoundRect(6, 6, 86, 80, 10, kCardBorder);
+  drawOe3Logo(10, 10);
+
+  M5.Display.fillRoundRect(98, 6, 216, 80, 10, kCard);
+  M5.Display.drawRoundRect(98, 6, 216, 80, 10, kCardBorder);
+  M5.Display.setTextColor(TFT_WHITE, kCard);
   M5.Display.setTextSize(2);
-  M5.Display.setCursor(8, 8);
+  M5.Display.setCursor(109, 15);
   M5.Display.print("WIFI SETUP");
-
-  M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
   M5.Display.setTextSize(1);
-  M5.Display.setCursor(8, 48);
-  M5.Display.print("1. Connect your phone to:");
-  M5.Display.setTextColor(TFT_CYAN, TFT_BLACK);
-  M5.Display.setTextSize(2);
-  M5.Display.setCursor(8, 67);
+  M5.Display.setTextColor(kMuted, kCard);
+  M5.Display.setCursor(109, 39);
   M5.Display.print(accessPointName);
-
-  M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
-  M5.Display.setTextSize(1);
-  M5.Display.setCursor(8, 98);
+  M5.Display.setCursor(109, 58);
   M5.Display.printf("Password: %s", accessPointPassword.c_str());
-  M5.Display.setCursor(8, 122);
-  M5.Display.print("2. Open http://192.168.4.1");
-  M5.Display.setCursor(8, 146);
-  M5.Display.print("3. Choose your 2.4 GHz WiFi");
-  M5.Display.setCursor(8, 170);
+
+  const char* steps[] = {
+      "Connect your phone to the hotspot",
+      "Open http://192.168.4.1",
+      "Choose your 2.4 GHz WiFi",
+  };
+  for (uint8_t index = 0; index < 3; ++index) {
+    const int32_t y = 96 + index * 35;
+    M5.Display.fillRoundRect(6, y, 308, 29, 7, kCard);
+    M5.Display.drawRoundRect(6, y, 308, 29, 7, kCardBorder);
+    M5.Display.fillCircle(22, y + 14, 9,
+                          index == 0 ? kOe3Red : kOe3Blue);
+    M5.Display.setTextColor(TFT_WHITE,
+                            index == 0 ? kOe3Red : kOe3Blue);
+    M5.Display.setCursor(19, y + 11);
+    M5.Display.print(index + 1);
+    M5.Display.setTextColor(TFT_WHITE, kCard);
+    M5.Display.setCursor(39, y + 11);
+    M5.Display.print(steps[index]);
+  }
+  M5.Display.setTextColor(kMuted, kBackground);
+  M5.Display.setCursor(34, 210);
   M5.Display.print("The setup hotspot closes after connection.");
   M5.Display.endWrite();
 }
@@ -336,8 +530,10 @@ void toggleSelectedStream() {
                         app_config::kStreamContentType,
                         app_config::kStreamTitle);
   if (result == CastClient::ToggleResult::kStarted) {
+    playbackState = UiPlaybackState::kPlaying;
     statusText = String("Playing OE3 on ") + device.name;
   } else if (result == CastClient::ToggleResult::kStopped) {
+    playbackState = UiPlaybackState::kStopped;
     statusText = String("Stopped stream on ") + device.name;
   } else {
     statusText = String("Toggle failed: ") + castClient.lastError();
@@ -425,6 +621,14 @@ void loop() {
     if (millis() - lastScanMs >= scanInterval) {
       scanCastDevices();
     }
+  }
+
+  if (playbackState == UiPlaybackState::kPlaying &&
+      millis() - lastEqualizerDrawMs >= 180) {
+    M5.Display.startWrite();
+    drawEqualizer();
+    M5.Display.endWrite();
+    lastEqualizerDrawMs = millis();
   }
 
   delay(10);
