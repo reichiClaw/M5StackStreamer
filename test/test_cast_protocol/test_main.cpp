@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "CastProtocol.h"
+#include "TextEncoding.h"
 
 void setUp() {}
 void tearDown() {}
@@ -79,6 +80,24 @@ void test_encoder_rejects_oversized_payload() {
   TEST_ASSERT_TRUE(encoded.empty());
 }
 
+void test_receiver_name_converts_german_characters_to_cp437() {
+  const std::string converted =
+      text_encoding::utf8ToCp437(u8"ÄÖÜ äöü ß ẞ");
+  const uint8_t expected[] = {
+      0x8e, 0x99, 0x9a, ' ', 0x84, 0x94, 0x81,
+      ' ',  0xe1, ' ',  'S', 'S',
+  };
+
+  TEST_ASSERT_EQUAL_size_t(sizeof(expected), converted.size());
+  TEST_ASSERT_EQUAL_MEMORY(expected, converted.data(), sizeof(expected));
+}
+
+void test_receiver_name_preserves_ascii_and_replaces_unknown_unicode() {
+  const std::string converted =
+      text_encoding::utf8ToCp437(u8"Living Room 🏠");
+  TEST_ASSERT_EQUAL_STRING("Living Room ?", converted.c_str());
+}
+
 int main(int, char**) {
   UNITY_BEGIN();
   RUN_TEST(test_round_trip_string_message);
@@ -86,5 +105,7 @@ int main(int, char**) {
   RUN_TEST(test_decoder_skips_unknown_fields);
   RUN_TEST(test_decoder_rejects_truncated_length_delimited_field);
   RUN_TEST(test_encoder_rejects_oversized_payload);
+  RUN_TEST(test_receiver_name_converts_german_characters_to_cp437);
+  RUN_TEST(test_receiver_name_preserves_ascii_and_replaces_unknown_unicode);
   return UNITY_END();
 }

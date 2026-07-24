@@ -16,7 +16,8 @@ http://orf-live.ors-shoutcast.at/oe3-q2a
 - Opens a password-protected captive portal for first-time Wi-Fi setup.
 - Discovers Chromecast, Chromecast Audio, Google TV, speakers, groups, and
   other Cast V2 receivers through `_googlecast._tcp` mDNS.
-- Lets you select a receiver on the M5Stack display.
+- Lets you select a receiver on the M5Stack display, including names containing
+  `Ä`, `Ö`, `Ü`, `ä`, `ö`, `ü`, and `ß`.
 - Launches the Default Media Receiver and loads OE3 as a live `audio/mpeg`
   source.
 - Uses the middle button as a remote-state start/stop toggle.
@@ -79,6 +80,10 @@ while powering on or resetting the M5Stack.
 The middle button queries the receiver itself instead of relying on remembered
 M5Stack state. The toggle therefore remains correct after either device
 restarts or after playback is changed externally.
+
+Cast receiver names arrive as UTF-8. The firmware converts supported German
+characters to the matching CP437 glyphs in the M5Stack's built-in display font,
+so no external font file or SD card is required.
 
 ## Change the station
 

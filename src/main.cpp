@@ -9,6 +9,7 @@
 
 #include "AppConfig.h"
 #include "CastClient.h"
+#include "TextEncoding.h"
 
 namespace {
 
@@ -38,6 +39,12 @@ String shortened(const String& value, size_t maximumCharacters) {
   return value.substring(0, maximumCharacters - 3) + "...";
 }
 
+String textForDisplay(const String& utf8Text) {
+  const std::string cp437Text = text_encoding::utf8ToCp437(
+      std::string(utf8Text.c_str(), utf8Text.length()));
+  return String(cp437Text.c_str());
+}
+
 void drawWrappedText(const String& text,
                      int32_t x,
                      int32_t y,
@@ -59,6 +66,8 @@ void drawWrappedText(const String& text,
 
 void drawMainScreen() {
   M5.Display.startWrite();
+  M5.Display.setAttribute(lgfx::UTF8_SWITCH, true);
+  M5.Display.cp437(false);
   M5.Display.fillScreen(TFT_BLACK);
   M5.Display.fillRect(0, 0, M5.Display.width(), 31, TFT_NAVY);
   M5.Display.setTextColor(TFT_WHITE, TFT_NAVY);
@@ -86,7 +95,12 @@ void drawMainScreen() {
   if (devices.empty()) {
     M5.Display.print("No receiver found");
   } else {
-    M5.Display.print(shortened(devices[selectedDevice].name, 25));
+    M5.Display.setAttribute(lgfx::UTF8_SWITCH, false);
+    M5.Display.cp437(true);
+    M5.Display.print(
+        shortened(textForDisplay(devices[selectedDevice].name), 25));
+    M5.Display.setAttribute(lgfx::UTF8_SWITCH, true);
+    M5.Display.cp437(false);
     M5.Display.setTextSize(1);
     M5.Display.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
     M5.Display.setCursor(8, 101);
@@ -102,7 +116,11 @@ void drawMainScreen() {
   M5.Display.setCursor(8, 126);
   M5.Display.print("STATUS");
   M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
-  drawWrappedText(statusText, 8, 142, 50, 5);
+  M5.Display.setAttribute(lgfx::UTF8_SWITCH, false);
+  M5.Display.cp437(true);
+  drawWrappedText(textForDisplay(statusText), 8, 142, 50, 5);
+  M5.Display.setAttribute(lgfx::UTF8_SWITCH, true);
+  M5.Display.cp437(false);
 
   const int32_t buttonTop = M5.Display.height() - 30;
   const int32_t third = M5.Display.width() / 3;
