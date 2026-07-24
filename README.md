@@ -81,7 +81,9 @@ while powering on or resetting the M5Stack.
 
 The middle button queries the receiver itself instead of relying on remembered
 M5Stack state. The toggle therefore remains correct after either device
-restarts or after playback is changed externally.
+restarts or after playback is changed externally. The query and resulting
+start/stop command share one TLS connection for compatibility with older
+Chromecast-built-in speakers.
 
 Cast receiver names arrive as UTF-8. The firmware converts supported German
 characters to the matching CP437 glyphs in the M5Stack's built-in display font,
@@ -119,6 +121,10 @@ Only use the controller on a trusted LAN.
 
 Google does not publish Cast V2 as a supported embedded-controller API.
 Protocol changes in future receiver firmware could require a firmware update.
+
+If a secure Cast connection fails, the firmware retries once and displays the
+underlying TLS error. The complete numeric error and target address are also
+available through `pio device monitor --baud 115200`.
 
 ## Logo artwork
 

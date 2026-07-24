@@ -43,7 +43,6 @@ class CastClient {
 
   enum class ReceiveResult { kMessage, kNoData, kError };
   enum class AppWaitResult { kFound, kNotFound, kTimeout, kError };
-  enum class PlaybackState { kActive, kInactive, kError };
 
   bool open(const IPAddress& address, uint16_t port);
   void close();
@@ -60,7 +59,6 @@ class CastClient {
   bool waitForLoadResult(uint32_t requestId,
                          const char* url,
                          uint32_t timeoutMs);
-  PlaybackState queryPlaybackState(const IPAddress& address, uint16_t port);
   bool waitForMediaActivity(uint32_t expectedRequestId,
                             uint32_t timeoutMs,
                             bool& active);
