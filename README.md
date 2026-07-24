@@ -20,9 +20,12 @@ http://orf-live.ors-shoutcast.at/oe3-q2a
   `Ä`, `Ö`, `Ü`, `ä`, `ö`, `ü`, and `ß`.
 - Uses an Ö3-branded card interface with receiver and status icons, colored
   controls, Wi-Fi state, and an animated on-air equalizer.
+- Keeps the Cast sender connected during playback, sends five-second
+  heartbeats, checks media health, and automatically reconnects or reloads the
+  stream after an unexpected interruption.
 - Launches the Default Media Receiver and loads OE3 as a live `audio/mpeg`
   source.
-- Uses the middle button as a remote-state start/stop toggle.
+- Uses the middle button to start or stop the maintained playback session.
 - Displays discovery, connection, launch, and media-load errors.
 - Automatically rescans while no receiver is available and recovers from a
   lost Wi-Fi connection.
@@ -76,14 +79,14 @@ while powering on or resetting the M5Stack.
 | Button | Action |
 | --- | --- |
 | A / NEXT | Select the next discovered receiver |
-| B / START-STOP | Stop active media; otherwise start or restart OE3 |
+| B / START-STOP | Stop maintained playback; otherwise query and start OE3 |
 | C / SCAN | Rescan the LAN for Cast receivers |
 
-The middle button queries the receiver itself instead of relying on remembered
-M5Stack state. The toggle therefore remains correct after either device
-restarts or after playback is changed externally. The query and resulting
-start/stop command share one TLS connection for compatibility with older
-Chromecast-built-in speakers.
+When no maintained session exists, the middle button queries the receiver
+before deciding whether to start or stop. Once OE3 is being maintained, the
+button first disables automatic recovery and then stops that session. Query and
+action share one TLS connection for compatibility with Chromecast-built-in
+speakers.
 
 Cast receiver names arrive as UTF-8. The firmware converts supported German
 characters to the matching CP437 glyphs in the M5Stack's built-in display font,
@@ -113,6 +116,8 @@ phone, a VPN-only address, or `localhost` will not work.
 6. Otherwise it launches the receiver and sends a `LOAD` request with stream
    type `LIVE` and content type `audio/mpeg`.
 7. Start success is shown only after `MEDIA_STATUS` reports `PLAYING`.
+8. While playing, it retains the TLS and application channels, polls media
+   status every 30 seconds, and uses bounded-backoff recovery when needed.
 
 Cast receivers use device-generated certificates on the local Cast port, so
 the firmware intentionally accepts the receiver's self-signed TLS certificate.
@@ -125,6 +130,16 @@ Protocol changes in future receiver firmware could require a firmware update.
 If a secure Cast connection fails, the firmware retries once and displays the
 underlying TLS error. The complete numeric error and target address are also
 available through `pio device monitor --baud 115200`.
+
+Automatic recovery remains enabled until the middle **START-STOP** button is
+used. Stopping playback from the receiver or another controller may therefore
+cause OE3 to restart on the next health check.
+
+For Marshall Heddon, install current firmware using the Marshall app. If the
+Cast session remains `PLAYING` but attached speakers become silent, remove
+their standard Bluetooth pairing while retaining the `[LE]` pairing used by
+the Marshall app; Marshall documents simultaneous Bluetooth and Auracast as a
+possible source of dropouts. Ethernet can also isolate Heddon's Wi-Fi path.
 
 ## Logo artwork
 

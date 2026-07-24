@@ -16,6 +16,7 @@ namespace {
 
 struct CastDevice {
   String name;
+  String id;
   IPAddress address;
   uint16_t port;
 };
@@ -48,6 +49,13 @@ uint32_t lastScanMs = 0;
 uint32_t wifiLostAtMs = 0;
 uint32_t lastEqualizerDrawMs = 0;
 UiPlaybackState playbackState = UiPlaybackState::kUnknown;
+
+void updateCastStatus(const String& message);
+
+CastClient& castController() {
+  static CastClient controller(updateCastStatus);
+  return controller;
+}
 
 String shortened(const String& value, size_t maximumCharacters) {
   if (value.length() <= maximumCharacters) {
@@ -420,9 +428,11 @@ void scanCastDevices() {
   }
 
   IPAddress previousAddress;
+  String previousId;
   bool hadSelection = !devices.empty();
   if (hadSelection) {
     previousAddress = devices[selectedDevice].address;
+    previousId = devices[selectedDevice].id;
   }
 
   statusText = "Scanning for Cast receivers...";
@@ -443,10 +453,12 @@ void scanCastDevices() {
     if (port == 0) {
       port = app_config::kDefaultCastPort;
     }
+    const String deviceId = MDNS.txt(index, "id");
 
     bool duplicate = false;
     for (const CastDevice& item : discovered) {
-      if (item.address == address && item.port == port) {
+      if ((!deviceId.isEmpty() && item.id == deviceId) ||
+          (item.address == address && item.port == port)) {
         duplicate = true;
         break;
       }
@@ -462,7 +474,7 @@ void scanCastDevices() {
     if (friendlyName.isEmpty()) {
       friendlyName = address.toString();
     }
-    discovered.push_back({friendlyName, address, port});
+    discovered.push_back({friendlyName, deviceId, address, port});
   }
 
   std::sort(discovered.begin(), discovered.end(),
@@ -473,11 +485,16 @@ void scanCastDevices() {
   selectedDevice = 0;
   if (hadSelection) {
     for (size_t index = 0; index < devices.size(); ++index) {
-      if (devices[index].address == previousAddress) {
+      if ((!previousId.isEmpty() && devices[index].id == previousId) ||
+          devices[index].address == previousAddress) {
         selectedDevice = index;
         break;
       }
     }
+  }
+  for (const CastDevice& item : devices) {
+    castController().updateDiscoveredEndpoint(item.id.c_str(), item.address,
+                                              item.port);
   }
 
   lastScanMs = millis();
@@ -517,16 +534,23 @@ void resetWifiIfRequested() {
 }
 
 void toggleSelectedStream() {
+  CastClient& castClient = castController();
   if (devices.empty()) {
+    if (castClient.cancelMaintenance()) {
+      playbackState = UiPlaybackState::kStopped;
+      statusText = "Playback recovery stopped";
+      drawMainScreen();
+      return;
+    }
     statusText = "No receiver selected. Press SCAN.";
     drawMainScreen();
     return;
   }
 
-  CastClient castClient(updateCastStatus);
   const CastDevice device = devices[selectedDevice];
   const CastClient::ToggleResult result =
-      castClient.toggle(device.address, device.port, app_config::kStreamUrl,
+      castClient.toggle(device.address, device.port, device.id.c_str(),
+                        app_config::kStreamUrl,
                         app_config::kStreamContentType,
                         app_config::kStreamTitle);
   if (result == CastClient::ToggleResult::kStarted) {
@@ -550,6 +574,13 @@ void handleWifiConnection() {
       WiFi.reconnect();
     } else if (millis() - wifiLostAtMs >=
                app_config::kWifiReconnectTimeoutMs) {
+      if (castController().isMaintainingPlayback()) {
+        wifiLostAtMs = millis();
+        statusText = "WiFi unavailable; still retrying";
+        drawMainScreen();
+        WiFi.reconnect();
+        return;
+      }
       statusText = "WiFi unavailable; restarting";
       drawMainScreen();
       delay(1000);
@@ -601,6 +632,17 @@ void setup() {
 void loop() {
   M5.update();
   handleWifiConnection();
+  const bool middleButton =
+      M5.BtnB.wasClicked() || M5.BtnB.wasHold();
+  bool middleButtonHandled = false;
+
+  if (middleButton && WiFi.status() != WL_CONNECTED &&
+      castController().cancelMaintenance()) {
+    middleButtonHandled = true;
+    playbackState = UiPlaybackState::kStopped;
+    statusText = "Playback recovery stopped";
+    drawMainScreen();
+  }
 
   if (WiFi.status() == WL_CONNECTED) {
     if (M5.BtnA.wasPressed() && !devices.empty()) {
@@ -608,9 +650,10 @@ void loop() {
       statusText = String("Selected ") + devices[selectedDevice].name;
       drawMainScreen();
     }
-    if (M5.BtnB.wasClicked() || M5.BtnB.wasHold()) {
+    if (middleButton && !middleButtonHandled) {
       toggleSelectedStream();
     }
+
     if (M5.BtnC.wasPressed()) {
       scanCastDevices();
     }
@@ -622,6 +665,7 @@ void loop() {
       scanCastDevices();
     }
   }
+  castController().service();
 
   if (playbackState == UiPlaybackState::kPlaying &&
       millis() - lastEqualizerDrawMs >= 180) {

@@ -29,9 +29,19 @@ class CastClient {
   // the supplied stream when the receiver is idle.
   ToggleResult toggle(const IPAddress& address,
                       uint16_t port,
+                      const char* deviceId,
                       const char* url,
                       const char* contentType,
                       const char* title);
+
+  // Services heartbeats and health checks for a stream started by toggle().
+  // Call frequently from the Arduino loop.
+  void service();
+  bool isMaintainingPlayback() const;
+  bool cancelMaintenance();
+  void updateDiscoveredEndpoint(const char* deviceId,
+                                const IPAddress& address,
+                                uint16_t port);
 
   const String& lastError() const;
 
@@ -52,6 +62,8 @@ class CastClient {
   bool writeAll(const uint8_t* data, size_t length);
   ReceiveResult receiveMessage(cast_protocol::Message& message,
                                uint32_t waitMs);
+  ReceiveResult receiveMessageNonBlocking(cast_protocol::Message& message);
+  void resetServiceReceiver();
   AppWaitResult waitForReceiverApplication(uint32_t expectedRequestId,
                                            uint32_t timeoutMs,
                                            bool finishOnMissingStatus,
@@ -64,6 +76,19 @@ class CastClient {
                             bool& active);
   bool handleHeartbeat(const cast_protocol::Message& message);
   bool sendHeartbeatIfDue();
+  bool maintainHeartbeat();
+  ToggleResult stopMaintainedPlayback();
+  void rememberPlayback(const IPAddress& address,
+                        uint16_t port,
+                        const char* deviceId,
+                        const char* url,
+                        const char* contentType,
+                        const char* title,
+                        const ReceiverApplication& application);
+  void clearMaintainedPlayback();
+  void scheduleRecovery(const String& reason);
+  bool loadMaintainedStream();
+  bool recoverMaintainedPlayback();
   uint32_t nextRequestId();
   void setError(const String& message);
   void report(const String& status) const;
@@ -72,5 +97,32 @@ class CastClient {
   StatusCallback statusCallback_;
   String lastError_;
   uint32_t requestId_;
-  uint32_t lastHeartbeatMs_;
+  uint32_t lastPingMs_;
+  bool pingOutstanding_;
+  uint32_t pingOutstandingSinceMs_;
+
+  bool maintainPlayback_;
+  IPAddress maintainedAddress_;
+  uint16_t maintainedPort_;
+  String maintainedDeviceId_;
+  String maintainedUrl_;
+  String maintainedContentType_;
+  String maintainedTitle_;
+  ReceiverApplication maintainedApplication_;
+  uint32_t lastMediaCheckMs_;
+  bool mediaCheckPending_;
+  uint32_t mediaCheckRequestId_;
+  uint32_t mediaCheckSentMs_;
+  uint32_t bufferingSinceMs_;
+  bool recoveryScheduled_;
+  uint32_t recoveryScheduledAtMs_;
+  uint32_t recoveryDelayMs_;
+  uint8_t recoveryFailures_;
+
+  uint8_t serviceHeader_[4];
+  size_t serviceHeaderBytes_;
+  uint32_t serviceFrameLength_;
+  size_t serviceFrameBytes_;
+  uint32_t serviceFrameStartedMs_;
+  uint8_t serviceFrame_[cast_protocol::kMaximumMessageSize];
 };
