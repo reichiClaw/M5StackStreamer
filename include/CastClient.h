@@ -9,6 +9,8 @@ class CastClient {
  public:
   using StatusCallback = void (*)(const String& status);
 
+  enum class ToggleResult { kStarted, kStopped, kError };
+
   explicit CastClient(StatusCallback statusCallback = nullptr);
 
   // Launches (or joins) the Default Media Receiver and asks it to load the
@@ -18,6 +20,18 @@ class CastClient {
             const char* url,
             const char* contentType,
             const char* title);
+
+  // Stops the Default Media Receiver on the target. This is idempotent: it
+  // succeeds when no Default Media Receiver session is currently running.
+  bool stop(const IPAddress& address, uint16_t port);
+
+  // Queries the receiver's real media state, then stops active media or starts
+  // the supplied stream when the receiver is idle.
+  ToggleResult toggle(const IPAddress& address,
+                      uint16_t port,
+                      const char* url,
+                      const char* contentType,
+                      const char* title);
 
   const String& lastError() const;
 
@@ -29,6 +43,7 @@ class CastClient {
 
   enum class ReceiveResult { kMessage, kNoData, kError };
   enum class AppWaitResult { kFound, kNotFound, kTimeout, kError };
+  enum class PlaybackState { kActive, kInactive, kError };
 
   bool open(const IPAddress& address, uint16_t port);
   void close();
@@ -45,6 +60,10 @@ class CastClient {
   bool waitForLoadResult(uint32_t requestId,
                          const char* url,
                          uint32_t timeoutMs);
+  PlaybackState queryPlaybackState(const IPAddress& address, uint16_t port);
+  bool waitForMediaActivity(uint32_t expectedRequestId,
+                            uint32_t timeoutMs,
+                            bool& active);
   bool handleHeartbeat(const cast_protocol::Message& message);
   bool sendHeartbeatIfDue();
   uint32_t nextRequestId();

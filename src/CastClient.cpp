@@ -154,6 +154,109 @@ bool CastClient::play(const IPAddress& address,
   return succeeded;
 }
 
+bool CastClient::stop(const IPAddress& address, uint16_t port) {
+  lastError_ = "";
+  ReceiverApplication application;
+  bool succeeded = false;
+
+  report("Opening secure Cast connection");
+  if (!open(address, port)) {
+    return false;
+  }
+
+  do {
+    if (!sendPayload(kPlatformDestinationId, kConnectionNamespace,
+                     F("{\"type\":\"CONNECT\",\"origin\":{}}"))) {
+      break;
+    }
+
+    const uint32_t statusRequestId = nextRequestId();
+    JsonDocument statusRequest;
+    statusRequest["type"] = "GET_STATUS";
+    statusRequest["requestId"] = statusRequestId;
+    String payload;
+    if (statusRequest.overflowed() ||
+        serializeJson(statusRequest, payload) == 0) {
+      setError("Not enough memory for status request");
+      break;
+    }
+    if (!sendPayload(kPlatformDestinationId, kReceiverNamespace, payload)) {
+      break;
+    }
+
+    report("Checking media receiver");
+    const AppWaitResult statusResult =
+        waitForReceiverApplication(statusRequestId, 4000, true, application);
+    if (statusResult == AppWaitResult::kError) {
+      break;
+    }
+    if (statusResult == AppWaitResult::kTimeout) {
+      setError("Receiver did not answer status request");
+      break;
+    }
+    if (statusResult == AppWaitResult::kNotFound) {
+      report("Stream is already stopped");
+      succeeded = true;
+      break;
+    }
+    if (application.sessionId.isEmpty()) {
+      setError("Receiver supplied no session ID");
+      break;
+    }
+
+    const uint32_t stopRequestId = nextRequestId();
+    JsonDocument stopRequest;
+    stopRequest["type"] = "STOP";
+    stopRequest["requestId"] = stopRequestId;
+    stopRequest["sessionId"] = application.sessionId;
+    payload = "";
+    if (stopRequest.overflowed() ||
+        serializeJson(stopRequest, payload) == 0) {
+      setError("Not enough memory for stop request");
+      break;
+    }
+
+    report("Stopping stream");
+    if (!sendPayload(kPlatformDestinationId, kReceiverNamespace, payload)) {
+      break;
+    }
+
+    const AppWaitResult stopResult =
+        waitForReceiverApplication(stopRequestId, 10000, true, application);
+    if (stopResult == AppWaitResult::kNotFound) {
+      report("Stream is stopped");
+      succeeded = true;
+    } else if (stopResult == AppWaitResult::kFound) {
+      setError("Receiver kept the media session open");
+    } else if (stopResult == AppWaitResult::kTimeout) {
+      setError("Receiver did not confirm stop");
+    }
+  } while (false);
+
+  close();
+  return succeeded;
+}
+
+CastClient::ToggleResult CastClient::toggle(const IPAddress& address,
+                                            uint16_t port,
+                                            const char* url,
+                                            const char* contentType,
+                                            const char* title) {
+  const PlaybackState state = queryPlaybackState(address, port);
+  if (state == PlaybackState::kError) {
+    return ToggleResult::kError;
+  }
+
+  if (state == PlaybackState::kActive) {
+    return stop(address, port) ? ToggleResult::kStopped
+                               : ToggleResult::kError;
+  }
+
+  return play(address, port, url, contentType, title)
+             ? ToggleResult::kStarted
+             : ToggleResult::kError;
+}
+
 const String& CastClient::lastError() const {
   return lastError_;
 }
@@ -400,7 +503,7 @@ CastClient::AppWaitResult CastClient::waitForReceiverApplication(
       }
     } else if (strcmp(type, "LAUNCH_ERROR") == 0 ||
                strcmp(type, "INVALID_REQUEST") == 0) {
-      setError(String("Receiver launch failed: ") + jsonReason(document));
+      setError(String("Receiver request failed: ") + jsonReason(document));
       return AppWaitResult::kError;
     }
   }
@@ -525,6 +628,172 @@ bool CastClient::waitForLoadResult(uint32_t requestId,
 
   setError(loadAcknowledged ? "Receiver did not start playing"
                             : "Receiver did not accept the stream");
+  return false;
+}
+
+CastClient::PlaybackState CastClient::queryPlaybackState(
+    const IPAddress& address,
+    uint16_t port) {
+  lastError_ = "";
+  ReceiverApplication application;
+  PlaybackState playbackState = PlaybackState::kError;
+
+  report("Checking receiver playback");
+  if (!open(address, port)) {
+    return PlaybackState::kError;
+  }
+
+  do {
+    if (!sendPayload(kPlatformDestinationId, kConnectionNamespace,
+                     F("{\"type\":\"CONNECT\",\"origin\":{}}"))) {
+      break;
+    }
+
+    const uint32_t receiverRequestId = nextRequestId();
+    JsonDocument receiverRequest;
+    receiverRequest["type"] = "GET_STATUS";
+    receiverRequest["requestId"] = receiverRequestId;
+    String payload;
+    if (receiverRequest.overflowed() ||
+        serializeJson(receiverRequest, payload) == 0) {
+      setError("Not enough memory for status request");
+      break;
+    }
+    if (!sendPayload(kPlatformDestinationId, kReceiverNamespace, payload)) {
+      break;
+    }
+
+    const AppWaitResult appResult =
+        waitForReceiverApplication(receiverRequestId, 4000, true, application);
+    if (appResult == AppWaitResult::kNotFound) {
+      playbackState = PlaybackState::kInactive;
+      break;
+    }
+    if (appResult == AppWaitResult::kTimeout) {
+      setError("Receiver did not answer status request");
+      break;
+    }
+    if (appResult != AppWaitResult::kFound) {
+      break;
+    }
+
+    if (!sendPayload(application.transportId, kConnectionNamespace,
+                     F("{\"type\":\"CONNECT\",\"origin\":{}}"))) {
+      break;
+    }
+
+    const uint32_t mediaRequestId = nextRequestId();
+    JsonDocument mediaRequest;
+    mediaRequest["type"] = "GET_STATUS";
+    mediaRequest["requestId"] = mediaRequestId;
+    if (!application.sessionId.isEmpty()) {
+      mediaRequest["sessionId"] = application.sessionId;
+    }
+    payload = "";
+    if (mediaRequest.overflowed() ||
+        serializeJson(mediaRequest, payload) == 0) {
+      setError("Not enough memory for media status request");
+      break;
+    }
+    if (!sendPayload(application.transportId, kMediaNamespace, payload)) {
+      break;
+    }
+
+    bool active = false;
+    if (!waitForMediaActivity(mediaRequestId, 5000, active)) {
+      break;
+    }
+    playbackState =
+        active ? PlaybackState::kActive : PlaybackState::kInactive;
+  } while (false);
+
+  close();
+  return playbackState;
+}
+
+bool CastClient::waitForMediaActivity(uint32_t expectedRequestId,
+                                      uint32_t timeoutMs,
+                                      bool& active) {
+  const uint32_t deadline = millis() + timeoutMs;
+  active = false;
+
+  while (!deadlineReached(deadline)) {
+    if (!sendHeartbeatIfDue()) {
+      return false;
+    }
+
+    cast_protocol::Message message;
+    const ReceiveResult receiveResult = receiveMessage(message, 250);
+    if (receiveResult == ReceiveResult::kError) {
+      return false;
+    }
+    if (receiveResult == ReceiveResult::kNoData) {
+      continue;
+    }
+
+    if (message.nameSpace == kHeartbeatNamespace) {
+      if (!handleHeartbeat(message)) {
+        return false;
+      }
+      continue;
+    }
+    if (message.nameSpace == kConnectionNamespace) {
+      JsonDocument connectionMessage;
+      if (deserializeJson(connectionMessage, message.payloadUtf8) ==
+              DeserializationError::Ok &&
+          strcmp(connectionMessage["type"] | "", "CLOSE") == 0) {
+        setError("Media receiver closed the channel");
+        return false;
+      }
+      continue;
+    }
+    if (message.nameSpace != kMediaNamespace || message.payloadType != 0) {
+      continue;
+    }
+
+    JsonDocument document;
+    if (deserializeJson(document, message.payloadUtf8)) {
+      setError("Invalid media status JSON");
+      return false;
+    }
+
+    const uint32_t responseRequestId = document["requestId"] | 0U;
+    if (responseRequestId != expectedRequestId) {
+      continue;
+    }
+
+    const char* type = document["type"] | "";
+    if (strcmp(type, "MEDIA_STATUS") == 0) {
+      if (!document["status"].is<JsonArrayConst>()) {
+        setError("Receiver returned malformed media status");
+        return false;
+      }
+      JsonArrayConst statuses = document["status"].as<JsonArrayConst>();
+      for (JsonObjectConst status : statuses) {
+        const char* state = status["playerState"] | "";
+        const char* extendedState =
+            status["extendedStatus"]["playerState"] | "";
+        if (strcmp(state, "PLAYING") == 0 ||
+            strcmp(state, "BUFFERING") == 0 ||
+            strcmp(state, "PAUSED") == 0 ||
+            (strcmp(state, "IDLE") == 0 &&
+             strcmp(extendedState, "LOADING") == 0)) {
+          active = true;
+          break;
+        }
+      }
+      return true;
+    }
+
+    if (strcmp(type, "INVALID_REQUEST") == 0 ||
+        strcmp(type, "INVALID_PLAYER_STATE") == 0 ||
+        strcmp(type, "ERROR") == 0) {
+      setError(String("Media status failed: ") + jsonReason(document));
+      return false;
+    }
+  }
+
+  setError("Receiver did not report media status");
   return false;
 }
 

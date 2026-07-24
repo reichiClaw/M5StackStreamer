@@ -113,8 +113,8 @@ void drawMainScreen() {
   M5.Display.setTextSize(1);
   M5.Display.setCursor(37, buttonTop + 11);
   M5.Display.print("NEXT");
-  M5.Display.setCursor(third + 38, buttonTop + 11);
-  M5.Display.print("CAST");
+  M5.Display.setCursor(third + 17, buttonTop + 11);
+  M5.Display.print("START / STOP");
   M5.Display.setCursor(third * 2 + 38, buttonTop + 11);
   M5.Display.print("SCAN");
   M5.Display.endWrite();
@@ -304,7 +304,7 @@ void resetWifiIfRequested() {
   ESP.restart();
 }
 
-void castSelectedStream() {
+void toggleSelectedStream() {
   if (devices.empty()) {
     statusText = "No receiver selected. Press SCAN.";
     drawMainScreen();
@@ -313,14 +313,16 @@ void castSelectedStream() {
 
   CastClient castClient(updateCastStatus);
   const CastDevice device = devices[selectedDevice];
-  const bool accepted =
-      castClient.play(device.address, device.port, app_config::kStreamUrl,
-                      app_config::kStreamContentType,
-                      app_config::kStreamTitle);
-  if (accepted) {
+  const CastClient::ToggleResult result =
+      castClient.toggle(device.address, device.port, app_config::kStreamUrl,
+                        app_config::kStreamContentType,
+                        app_config::kStreamTitle);
+  if (result == CastClient::ToggleResult::kStarted) {
     statusText = String("Playing OE3 on ") + device.name;
+  } else if (result == CastClient::ToggleResult::kStopped) {
+    statusText = String("Stopped stream on ") + device.name;
   } else {
-    statusText = String("Cast failed: ") + castClient.lastError();
+    statusText = String("Toggle failed: ") + castClient.lastError();
   }
   drawMainScreen();
 }
@@ -392,8 +394,8 @@ void loop() {
       statusText = String("Selected ") + devices[selectedDevice].name;
       drawMainScreen();
     }
-    if (M5.BtnB.wasPressed()) {
-      castSelectedStream();
+    if (M5.BtnB.wasClicked() || M5.BtnB.wasHold()) {
+      toggleSelectedStream();
     }
     if (M5.BtnC.wasPressed()) {
       scanCastDevices();

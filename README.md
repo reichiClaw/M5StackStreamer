@@ -19,6 +19,7 @@ http://orf-live.ors-shoutcast.at/oe3-q2a
 - Lets you select a receiver on the M5Stack display.
 - Launches the Default Media Receiver and loads OE3 as a live `audio/mpeg`
   source.
+- Uses the middle button as a remote-state start/stop toggle.
 - Displays discovery, connection, launch, and media-load errors.
 - Automatically rescans while no receiver is available and recovers from a
   lost Wi-Fi connection.
@@ -72,10 +73,12 @@ while powering on or resetting the M5Stack.
 | Button | Action |
 | --- | --- |
 | A / NEXT | Select the next discovered receiver |
-| B / CAST | Start OE3 on the selected receiver |
+| B / START-STOP | Stop active media; otherwise start or restart OE3 |
 | C / SCAN | Rescan the LAN for Cast receivers |
 
-Press **CAST** again to retry or restart the stream.
+The middle button queries the receiver itself instead of relying on remembered
+M5Stack state. The toggle therefore remains correct after either device
+restarts or after playback is changed externally.
 
 ## Change the station
 
@@ -95,11 +98,12 @@ phone, a VPN-only address, or `localhost` will not work.
 1. WiFiManager connects with saved credentials or exposes the setup portal.
 2. ESPmDNS queries for `_googlecast._tcp` services.
 3. The firmware opens TLS to the selected receiver's advertised Cast port.
-4. It speaks the Cast V2 protobuf-framed protocol, launches app `CC1AD845`
-   (Default Media Receiver), and obtains its transport and session IDs.
-5. It sends a `LOAD` request with stream type `LIVE` and content type
-   `audio/mpeg`.
-6. Success is shown only after `MEDIA_STATUS` reports `PLAYING`.
+4. It speaks the Cast V2 protobuf-framed protocol and queries app `CC1AD845`
+   (Default Media Receiver) for its actual media state.
+5. If media is active, it sends a receiver `STOP` request.
+6. Otherwise it launches the receiver and sends a `LOAD` request with stream
+   type `LIVE` and content type `audio/mpeg`.
+7. Start success is shown only after `MEDIA_STATUS` reports `PLAYING`.
 
 Cast receivers use device-generated certificates on the local Cast port, so
 the firmware intentionally accepts the receiver's self-signed TLS certificate.
