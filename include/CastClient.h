@@ -91,6 +91,7 @@ class CastClient {
   bool recoverMaintainedPlayback();
   uint32_t nextRequestId();
   void setError(const String& message);
+  void addErrorContext(const char* operation);
   void report(const String& status) const;
 
   WiFiClientSecure client_;

@@ -78,6 +78,7 @@ bool CastClient::play(const IPAddress& address,
   do {
     if (!sendPayload(kPlatformDestinationId, kConnectionNamespace,
                      F("{\"type\":\"CONNECT\",\"origin\":{}}"))) {
+      addErrorContext("Platform connect");
       break;
     }
 
@@ -92,6 +93,7 @@ bool CastClient::play(const IPAddress& address,
       break;
     }
     if (!sendPayload(kPlatformDestinationId, kReceiverNamespace, payload)) {
+      addErrorContext("Receiver status request");
       break;
     }
 
@@ -99,6 +101,7 @@ bool CastClient::play(const IPAddress& address,
     AppWaitResult appResult =
         waitForReceiverApplication(statusRequestId, 4000, true, application);
     if (appResult == AppWaitResult::kError) {
+      addErrorContext("Receiver status");
       break;
     }
 
@@ -150,7 +153,6 @@ bool CastClient::play(const IPAddress& address,
     media["contentId"] = url;
     media["contentType"] = contentType;
     media["streamType"] = "LIVE";
-    media["duration"] = -1;
     JsonObject metadata = media["metadata"].to<JsonObject>();
     metadata["metadataType"] = 0;
     metadata["title"] = title;
@@ -308,6 +310,7 @@ CastClient::ToggleResult CastClient::toggle(const IPAddress& address,
   do {
     if (!sendPayload(kPlatformDestinationId, kConnectionNamespace,
                      F("{\"type\":\"CONNECT\",\"origin\":{}}"))) {
+      addErrorContext("Platform connect");
       break;
     }
 
@@ -323,6 +326,7 @@ CastClient::ToggleResult CastClient::toggle(const IPAddress& address,
       break;
     }
     if (!sendPayload(kPlatformDestinationId, kReceiverNamespace, payload)) {
+      addErrorContext("Receiver status request");
       break;
     }
 
@@ -333,6 +337,7 @@ CastClient::ToggleResult CastClient::toggle(const IPAddress& address,
       break;
     }
     if (appResult == AppWaitResult::kError) {
+      addErrorContext("Receiver status");
       break;
     }
 
@@ -340,6 +345,7 @@ CastClient::ToggleResult CastClient::toggle(const IPAddress& address,
     if (appResult == AppWaitResult::kFound) {
       if (!sendPayload(application.transportId, kConnectionNamespace,
                        F("{\"type\":\"CONNECT\",\"origin\":{}}"))) {
+        addErrorContext("Application connect");
         break;
       }
       applicationChannelConnected = true;
@@ -357,8 +363,12 @@ CastClient::ToggleResult CastClient::toggle(const IPAddress& address,
         setError("Not enough memory for media status request");
         break;
       }
-      if (!sendPayload(application.transportId, kMediaNamespace, payload) ||
-          !waitForMediaActivity(mediaRequestId, 5000, active)) {
+      if (!sendPayload(application.transportId, kMediaNamespace, payload)) {
+        addErrorContext("Media status request");
+        break;
+      }
+      if (!waitForMediaActivity(mediaRequestId, 5000, active)) {
+        addErrorContext("Media status");
         break;
       }
     }
@@ -383,6 +393,7 @@ CastClient::ToggleResult CastClient::toggle(const IPAddress& address,
 
       report("Stopping stream");
       if (!sendPayload(kPlatformDestinationId, kReceiverNamespace, payload)) {
+        addErrorContext("Stop request");
         break;
       }
       const AppWaitResult stopResult =
@@ -394,6 +405,8 @@ CastClient::ToggleResult CastClient::toggle(const IPAddress& address,
         setError("Receiver kept the media session open");
       } else if (stopResult == AppWaitResult::kTimeout) {
         setError("Receiver did not confirm stop");
+      } else if (stopResult == AppWaitResult::kError) {
+        addErrorContext("Stop request");
       }
       break;
     }
@@ -412,13 +425,16 @@ CastClient::ToggleResult CastClient::toggle(const IPAddress& address,
         break;
       }
       if (!sendPayload(kPlatformDestinationId, kReceiverNamespace, payload)) {
+        addErrorContext("Receiver launch request");
         break;
       }
 
       appResult = waitForReceiverApplication(launchRequestId, 20000, false,
                                              application);
       if (appResult != AppWaitResult::kFound) {
-        if (appResult != AppWaitResult::kError) {
+        if (appResult == AppWaitResult::kError) {
+          addErrorContext("Receiver launch");
+        } else {
           setError("Media receiver did not start");
         }
         break;
@@ -429,6 +445,7 @@ CastClient::ToggleResult CastClient::toggle(const IPAddress& address,
       report("Connecting to media receiver");
       if (!sendPayload(application.transportId, kConnectionNamespace,
                        F("{\"type\":\"CONNECT\",\"origin\":{}}"))) {
+        addErrorContext("Application connect");
         break;
       }
     }
@@ -447,7 +464,6 @@ CastClient::ToggleResult CastClient::toggle(const IPAddress& address,
     media["contentId"] = url;
     media["contentType"] = contentType;
     media["streamType"] = "LIVE";
-    media["duration"] = -1;
     JsonObject metadata = media["metadata"].to<JsonObject>();
     metadata["metadataType"] = 0;
     metadata["title"] = title;
@@ -459,8 +475,12 @@ CastClient::ToggleResult CastClient::toggle(const IPAddress& address,
       break;
     }
     report("Sending OE3 stream");
-    if (!sendPayload(application.transportId, kMediaNamespace, payload) ||
-        !waitForLoadResult(loadRequestId, url, 25000)) {
+    if (!sendPayload(application.transportId, kMediaNamespace, payload)) {
+      addErrorContext("Stream load request");
+      break;
+    }
+    if (!waitForLoadResult(loadRequestId, url, 25000)) {
+      addErrorContext("Stream load");
       break;
     }
 
@@ -615,7 +635,6 @@ bool CastClient::loadMaintainedStream() {
   media["contentId"] = maintainedUrl_;
   media["contentType"] = maintainedContentType_;
   media["streamType"] = "LIVE";
-  media["duration"] = -1;
   JsonObject metadata = media["metadata"].to<JsonObject>();
   metadata["metadataType"] = 0;
   metadata["title"] = maintainedTitle_;
@@ -1578,6 +1597,16 @@ uint32_t CastClient::nextRequestId() {
 void CastClient::setError(const String& message) {
   lastError_ = message;
   report(String("Error: ") + message);
+}
+
+void CastClient::addErrorContext(const char* operation) {
+  const String previousError = lastError_;
+  String contextualError = operation;
+  if (!previousError.isEmpty()) {
+    contextualError += ": ";
+    contextualError += previousError;
+  }
+  setError(contextualError);
 }
 
 void CastClient::report(const String& status) const {
