@@ -73,7 +73,9 @@ class CastClient {
                          uint32_t timeoutMs);
   bool waitForMediaActivity(uint32_t expectedRequestId,
                             uint32_t timeoutMs,
-                            bool& active);
+                            bool& active,
+                            bool* paused = nullptr,
+                            bool* configuredContent = nullptr);
   bool handleHeartbeat(const cast_protocol::Message& message);
   bool sendHeartbeatIfDue();
   bool maintainHeartbeat();
@@ -88,6 +90,7 @@ class CastClient {
   void clearMaintainedPlayback();
   void scheduleRecovery(const String& reason);
   bool loadMaintainedStream();
+  bool resumeMaintainedStream();
   bool recoverMaintainedPlayback();
   uint32_t nextRequestId();
   void setError(const String& message);
@@ -97,8 +100,12 @@ class CastClient {
   WiFiClientSecure client_;
   StatusCallback statusCallback_;
   String lastError_;
+  String sourceId_;
   uint32_t requestId_;
   uint32_t lastPingMs_;
+  uint32_t heartbeatSent_;
+  uint32_t heartbeatPongs_;
+  uint32_t heartbeatPeerPings_;
 
   bool maintainPlayback_;
   IPAddress maintainedAddress_;
@@ -108,10 +115,12 @@ class CastClient {
   String maintainedContentType_;
   String maintainedTitle_;
   ReceiverApplication maintainedApplication_;
+  int32_t maintainedMediaSessionId_;
   uint32_t lastMediaCheckMs_;
   bool mediaCheckPending_;
   uint32_t mediaCheckRequestId_;
   uint32_t mediaCheckSentMs_;
+  uint8_t resumeAttempts_;
   uint32_t bufferingSinceMs_;
   bool recoveryScheduled_;
   uint32_t recoveryScheduledAtMs_;

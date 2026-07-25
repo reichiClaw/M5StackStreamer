@@ -15,7 +15,6 @@
 
 namespace {
 
-constexpr char kSourceId[] = "sender-0";
 constexpr char kPlatformDestinationId[] = "receiver-0";
 constexpr char kDefaultMediaReceiverAppId[] = "CC1AD845";
 constexpr char kConnectionNamespace[] =
@@ -92,14 +91,20 @@ void logCastMessage(const char* direction,
 
 CastClient::CastClient(StatusCallback statusCallback)
     : statusCallback_(statusCallback),
+      sourceId_("sender-0"),
       requestId_((esp_random() & 0x3fffffffU) + 1),
       lastPingMs_(0),
+      heartbeatSent_(0),
+      heartbeatPongs_(0),
+      heartbeatPeerPings_(0),
       maintainPlayback_(false),
       maintainedPort_(0),
+      maintainedMediaSessionId_(-1),
       lastMediaCheckMs_(0),
       mediaCheckPending_(false),
       mediaCheckRequestId_(0),
       mediaCheckSentMs_(0),
+      resumeAttempts_(0),
       bufferingSinceMs_(0),
       recoveryScheduled_(false),
       recoveryScheduledAtMs_(0),
@@ -235,6 +240,7 @@ bool CastClient::play(const IPAddress& address,
     mediaCheckPending_ = false;
     mediaCheckRequestId_ = 0;
     mediaCheckSentMs_ = 0;
+    resumeAttempts_ = 0;
     bufferingSinceMs_ = 0;
   } else {
     close();
@@ -618,6 +624,7 @@ void CastClient::rememberPlayback(
   mediaCheckPending_ = false;
   mediaCheckRequestId_ = 0;
   mediaCheckSentMs_ = 0;
+  resumeAttempts_ = 0;
   bufferingSinceMs_ = 0;
 }
 
@@ -630,10 +637,12 @@ void CastClient::clearMaintainedPlayback() {
   maintainedContentType_ = "";
   maintainedTitle_ = "";
   maintainedApplication_ = ReceiverApplication();
+  maintainedMediaSessionId_ = -1;
   lastMediaCheckMs_ = 0;
   mediaCheckPending_ = false;
   mediaCheckRequestId_ = 0;
   mediaCheckSentMs_ = 0;
+  resumeAttempts_ = 0;
   bufferingSinceMs_ = 0;
   recoveryScheduled_ = false;
   recoveryScheduledAtMs_ = 0;
@@ -642,11 +651,21 @@ void CastClient::clearMaintainedPlayback() {
 }
 
 void CastClient::scheduleRecovery(const String& reason) {
+  diagnostics::logf(
+      "RECOVERY reason=\"%s\" sender=%s heartbeats_sent=%lu pongs=%lu "
+      "peer_pings=%lu failures=%u",
+      reason.c_str(), sourceId_.c_str(),
+      static_cast<unsigned long>(heartbeatSent_),
+      static_cast<unsigned long>(heartbeatPongs_),
+      static_cast<unsigned long>(heartbeatPeerPings_),
+      static_cast<unsigned int>(recoveryFailures_));
   close();
   maintainedApplication_ = ReceiverApplication();
+  maintainedMediaSessionId_ = -1;
   mediaCheckPending_ = false;
   mediaCheckRequestId_ = 0;
   mediaCheckSentMs_ = 0;
+  resumeAttempts_ = 0;
   bufferingSinceMs_ = 0;
 
   uint8_t shift = recoveryFailures_;
@@ -697,6 +716,7 @@ bool CastClient::loadMaintainedStream() {
   }
 
   report("Restarting OE3 stream");
+  maintainedMediaSessionId_ = -1;
   if (!sendPayload(maintainedApplication_.transportId, kMediaNamespace,
                    payload)) {
     return false;
@@ -710,7 +730,47 @@ bool CastClient::loadMaintainedStream() {
   mediaCheckPending_ = false;
   mediaCheckRequestId_ = 0;
   mediaCheckSentMs_ = 0;
+  resumeAttempts_ = 0;
   bufferingSinceMs_ = 0;
+  return true;
+}
+
+bool CastClient::resumeMaintainedStream() {
+  if (maintainedMediaSessionId_ < 0 ||
+      maintainedApplication_.transportId.isEmpty()) {
+    return loadMaintainedStream();
+  }
+
+  const uint32_t playRequestId = nextRequestId();
+  JsonDocument playRequest;
+  playRequest["type"] = "PLAY";
+  playRequest["requestId"] = playRequestId;
+  playRequest["mediaSessionId"] = maintainedMediaSessionId_;
+  if (!maintainedApplication_.sessionId.isEmpty()) {
+    playRequest["sessionId"] = maintainedApplication_.sessionId;
+  }
+  String payload;
+  if (playRequest.overflowed() ||
+      serializeJson(playRequest, payload) == 0) {
+    setError("Not enough memory for resume request");
+    return false;
+  }
+
+  report("Resuming OE3 stream");
+  if (!sendPayload(maintainedApplication_.transportId, kMediaNamespace,
+                   payload)) {
+    return false;
+  }
+  if (resumeAttempts_ < 255) {
+    ++resumeAttempts_;
+  }
+  recoveryScheduled_ = false;
+  recoveryScheduledAtMs_ = 0;
+  recoveryDelayMs_ = 0;
+  lastMediaCheckMs_ = millis();
+  mediaCheckPending_ = true;
+  mediaCheckRequestId_ = playRequestId;
+  mediaCheckSentMs_ = millis();
   return true;
 }
 
@@ -791,11 +851,19 @@ bool CastClient::recoverMaintainedPlayback() {
       }
 
       bool active = false;
-      if (!waitForMediaActivity(mediaRequestId, 5000, active)) {
+      bool paused = false;
+      bool configuredContent = false;
+      if (!waitForMediaActivity(mediaRequestId, 5000, active, &paused,
+                                &configuredContent)) {
         if (client_.connected()) {
           report("Media state unavailable; requesting OE3");
           succeeded = loadMaintainedStream();
         }
+        break;
+      }
+      if (paused) {
+        succeeded = configuredContent ? resumeMaintainedStream()
+                                      : loadMaintainedStream();
         break;
       }
       if (active) {
@@ -857,6 +925,16 @@ void CastClient::service() {
   }
 
   if (!client_.connected()) {
+    if (!recoveryScheduled_) {
+      diagnostics::logf(
+          "TLS disconnected sender=%s heartbeats_sent=%lu pongs=%lu "
+          "peer_pings=%lu",
+          sourceId_.c_str(), static_cast<unsigned long>(heartbeatSent_),
+          static_cast<unsigned long>(heartbeatPongs_),
+          static_cast<unsigned long>(heartbeatPeerPings_));
+      scheduleRecovery("Cast socket disconnected");
+      return;
+    }
     if (recoveryScheduled_ &&
         millis() - recoveryScheduledAtMs_ < recoveryDelayMs_) {
       return;
@@ -925,24 +1003,52 @@ void CastClient::service() {
       const char* type = mediaStatus["type"] | "";
       if (strcmp(type, "MEDIA_STATUS") != 0 ||
           !mediaStatus["status"].is<JsonArrayConst>()) {
+        const bool resumeWasPending = resumeAttempts_ > 0;
         mediaCheckPending_ = false;
         mediaCheckRequestId_ = 0;
         mediaCheckSentMs_ = 0;
         lastMediaCheckMs_ = millis();
+        if (resumeWasPending) {
+          if (!loadMaintainedStream()) {
+            scheduleRecovery("Resume rejected");
+            return;
+          }
+          continue;
+        }
         report("Media status rejected; keeping Cast session");
         continue;
       }
 
       bool active = false;
+      bool paused = false;
+      bool configuredContent = false;
       JsonArrayConst statuses = mediaStatus["status"].as<JsonArrayConst>();
       for (JsonObjectConst status : statuses) {
         const char* state = status["playerState"] | "";
         const char* extendedState =
             status["extendedStatus"]["playerState"] | "";
+        const char* idleReason = status["idleReason"] | "";
+        const char* contentId = status["media"]["contentId"] | "";
+        configuredContent =
+            contentId[0] != '\0' && maintainedUrl_ == contentId;
+        const int32_t mediaSessionId = status["mediaSessionId"] | -1;
+        if (mediaSessionId >= 0) {
+          maintainedMediaSessionId_ = mediaSessionId;
+        }
+        diagnostics::logf(
+            "MEDIA state=%s extended=%s idle=%s media_session=%ld "
+            "content=\"%s\"",
+            state, extendedState, idleReason,
+            static_cast<long>(mediaSessionId), contentId);
         if (strcmp(state, "PLAYING") == 0) {
           bufferingSinceMs_ = 0;
           recoveryFailures_ = 0;
+          resumeAttempts_ = 0;
           active = true;
+          break;
+        }
+        if (strcmp(state, "PAUSED") == 0) {
+          paused = true;
           break;
         }
         if (strcmp(state, "BUFFERING") == 0 ||
@@ -961,7 +1067,17 @@ void CastClient::service() {
       mediaCheckRequestId_ = 0;
       mediaCheckSentMs_ = 0;
       lastMediaCheckMs_ = millis();
-      if (!active && !loadMaintainedStream()) {
+      if (paused) {
+        const bool requested =
+            configuredContent && resumeAttempts_ < 2
+                ? resumeMaintainedStream()
+                : loadMaintainedStream();
+        if (!requested) {
+          scheduleRecovery("Stream resume failed");
+          return;
+        }
+      }
+      if (!paused && !active && !loadMaintainedStream()) {
         scheduleRecovery("Stream restart failed");
         return;
       }
@@ -970,11 +1086,18 @@ void CastClient::service() {
 
   if (mediaCheckPending_) {
     if (millis() - mediaCheckSentMs_ >= 5000) {
+      const bool resumeWasPending = resumeAttempts_ > 0;
       mediaCheckPending_ = false;
       mediaCheckRequestId_ = 0;
       mediaCheckSentMs_ = 0;
       lastMediaCheckMs_ = millis();
-      report("Media status delayed; keeping Cast session");
+      if (resumeWasPending) {
+        if (!loadMaintainedStream()) {
+          scheduleRecovery("Resume status timed out");
+        }
+      } else {
+        report("Media status delayed; keeping Cast session");
+      }
     }
     return;
   }
@@ -1023,7 +1146,6 @@ bool CastClient::open(const IPAddress& address, uint16_t port) {
   for (uint8_t attempt = 0; attempt < 3; ++attempt) {
     client_.stop();
     client_.setInsecure();
-    client_.setTimeout(10);
     client_.setHandshakeTimeout(15);
 
     diagnostics::logf(
@@ -1036,12 +1158,21 @@ bool CastClient::open(const IPAddress& address, uint16_t port) {
         ESP.getMinFreeHeap(), ESP.getFreePsram());
     const uint32_t startedAt = millis();
     errno = 0;
-    if (client_.connect(address, port)) {
+    if (client_.connect(address, port, 10000)) {
+      client_.setTimeout(10);
+      char senderId[24];
+      snprintf(senderId, sizeof(senderId), "sender-%08X",
+               static_cast<unsigned int>(esp_random()));
+      sourceId_ = senderId;
       lastPingMs_ = millis();
-      diagnostics::logf("TLS connected attempt=%u elapsed=%lums fd=%d",
+      heartbeatSent_ = 0;
+      heartbeatPongs_ = 0;
+      heartbeatPeerPings_ = 0;
+      diagnostics::logf(
+          "TLS connected attempt=%u elapsed=%lums fd=%d sender=%s",
                         static_cast<unsigned int>(attempt + 1),
                         static_cast<unsigned long>(millis() - startedAt),
-                        client_.fd());
+                        client_.fd(), sourceId_.c_str());
       return true;
     }
 
@@ -1093,11 +1224,11 @@ void CastClient::close() {
 bool CastClient::sendPayload(const String& destinationId,
                              const char* nameSpace,
                              const String& payload) {
-  logCastMessage("TX", kSourceId, destinationId.c_str(), nameSpace,
+  logCastMessage("TX", sourceId_.c_str(), destinationId.c_str(), nameSpace,
                  payload.c_str(), payload.length());
   std::vector<uint8_t> encoded;
   if (!cast_protocol::encodeStringMessage(
-          kSourceId, destinationId.c_str(), nameSpace,
+          sourceId_.c_str(), destinationId.c_str(), nameSpace,
           std::string(payload.c_str(), payload.length()), encoded)) {
     setError("Cast message is too large");
     return false;
@@ -1497,6 +1628,7 @@ bool CastClient::waitForLoadResult(uint32_t requestId,
           loadAcknowledged = true;
           if (candidateSessionId >= 0) {
             mediaSessionId = candidateSessionId;
+            maintainedMediaSessionId_ = candidateSessionId;
           }
         }
 
@@ -1545,9 +1677,17 @@ bool CastClient::waitForLoadResult(uint32_t requestId,
 
 bool CastClient::waitForMediaActivity(uint32_t expectedRequestId,
                                       uint32_t timeoutMs,
-                                      bool& active) {
+                                      bool& active,
+                                      bool* paused,
+                                      bool* configuredContent) {
   const uint32_t deadline = millis() + timeoutMs;
   active = false;
+  if (paused != nullptr) {
+    *paused = false;
+  }
+  if (configuredContent != nullptr) {
+    *configuredContent = false;
+  }
 
   while (!deadlineReached(deadline)) {
     if (!maintainHeartbeat()) {
@@ -1606,9 +1746,27 @@ bool CastClient::waitForMediaActivity(uint32_t expectedRequestId,
         const char* state = status["playerState"] | "";
         const char* extendedState =
             status["extendedStatus"]["playerState"] | "";
+        const char* contentId = status["media"]["contentId"] | "";
+        if (configuredContent != nullptr) {
+          *configuredContent =
+              contentId[0] != '\0' && maintainedUrl_ == contentId;
+        }
+        const int32_t mediaSessionId = status["mediaSessionId"] | -1;
+        if (mediaSessionId >= 0) {
+          maintainedMediaSessionId_ = mediaSessionId;
+        }
+        diagnostics::logf(
+            "MEDIA query state=%s extended=%s media_session=%ld",
+            state, extendedState, static_cast<long>(mediaSessionId));
         if (strcmp(state, "PLAYING") == 0) {
           bufferingSinceMs_ = 0;
           active = true;
+          break;
+        }
+        if (strcmp(state, "PAUSED") == 0) {
+          if (paused != nullptr) {
+            *paused = true;
+          }
           break;
         }
         if (strcmp(state, "BUFFERING") == 0 ||
@@ -1649,7 +1807,11 @@ bool CastClient::handleHeartbeat(const cast_protocol::Message& message) {
   }
 
   const char* type = document["type"] | "";
+  if (strcmp(type, "PONG") == 0) {
+    ++heartbeatPongs_;
+  }
   if (strcmp(type, "PING") == 0) {
+    ++heartbeatPeerPings_;
     const String destination =
         message.sourceId.empty() ? String(kPlatformDestinationId)
                                  : String(message.sourceId.c_str());
@@ -1675,6 +1837,7 @@ bool CastClient::sendHeartbeatIfDue() {
     return false;
   }
   lastPingMs_ = millis();
+  ++heartbeatSent_;
   return true;
 }
 
