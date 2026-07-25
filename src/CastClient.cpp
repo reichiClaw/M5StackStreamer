@@ -735,7 +735,7 @@ bool CastClient::loadMaintainedStream() {
   return true;
 }
 
-bool CastClient::resumeMaintainedStream() {
+bool CastClient::resumeMaintainedStream(bool trackResponse) {
   if (maintainedMediaSessionId_ < 0 ||
       maintainedApplication_.transportId.isEmpty()) {
     return loadMaintainedStream();
@@ -756,21 +756,29 @@ bool CastClient::resumeMaintainedStream() {
     return false;
   }
 
-  report("Resuming OE3 stream");
+  report(trackResponse ? "Resuming OE3 stream"
+                       : "Reasserting OE3 playback");
   if (!sendPayload(maintainedApplication_.transportId, kMediaNamespace,
                    payload)) {
     return false;
-  }
-  if (resumeAttempts_ < 255) {
-    ++resumeAttempts_;
   }
   recoveryScheduled_ = false;
   recoveryScheduledAtMs_ = 0;
   recoveryDelayMs_ = 0;
   lastMediaCheckMs_ = millis();
-  mediaCheckPending_ = true;
-  mediaCheckRequestId_ = playRequestId;
-  mediaCheckSentMs_ = millis();
+  if (trackResponse) {
+    if (resumeAttempts_ < 255) {
+      ++resumeAttempts_;
+    }
+    mediaCheckPending_ = true;
+    mediaCheckRequestId_ = playRequestId;
+    mediaCheckSentMs_ = millis();
+  } else {
+    resumeAttempts_ = 0;
+    mediaCheckPending_ = false;
+    mediaCheckRequestId_ = 0;
+    mediaCheckSentMs_ = 0;
+  }
   return true;
 }
 
@@ -853,11 +861,20 @@ bool CastClient::recoverMaintainedPlayback() {
       bool active = false;
       bool paused = false;
       bool configuredContent = false;
-      if (!waitForMediaActivity(mediaRequestId, 5000, active, &paused,
-                                &configuredContent)) {
-        if (client_.connected()) {
-          report("Media state unavailable; requesting OE3");
-          succeeded = loadMaintainedStream();
+      bool playing = false;
+      if (!waitForMediaActivity(mediaRequestId, 7000, active, &paused,
+                                &configuredContent, &playing)) {
+        if (client_.connected() &&
+            lastError_ == "Receiver did not report media status") {
+          report("Media state delayed; keeping existing playback");
+          mediaCheckPending_ = true;
+          mediaCheckRequestId_ = mediaRequestId;
+          mediaCheckSentMs_ = millis();
+          lastMediaCheckMs_ = millis();
+          recoveryScheduled_ = false;
+          recoveryScheduledAtMs_ = 0;
+          recoveryDelayMs_ = 0;
+          succeeded = true;
         }
         break;
       }
@@ -867,6 +884,11 @@ bool CastClient::recoverMaintainedPlayback() {
         break;
       }
       if (active) {
+        if (playing && configuredContent) {
+          recoveryFailures_ = 0;
+          succeeded = resumeMaintainedStream(false);
+          break;
+        }
         recoveryScheduled_ = false;
         recoveryScheduledAtMs_ = 0;
         recoveryDelayMs_ = 0;
@@ -995,8 +1017,7 @@ void CastClient::service() {
         continue;
       }
       const uint32_t responseRequestId = mediaStatus["requestId"] | 0U;
-      if (responseRequestId != 0 &&
-          responseRequestId != mediaCheckRequestId_) {
+      if (responseRequestId != mediaCheckRequestId_) {
         continue;
       }
 
@@ -1022,6 +1043,7 @@ void CastClient::service() {
       bool active = false;
       bool paused = false;
       bool configuredContent = false;
+      bool reassertPlay = false;
       JsonArrayConst statuses = mediaStatus["status"].as<JsonArrayConst>();
       for (JsonObjectConst status : statuses) {
         const char* state = status["playerState"] | "";
@@ -1029,9 +1051,13 @@ void CastClient::service() {
             status["extendedStatus"]["playerState"] | "";
         const char* idleReason = status["idleReason"] | "";
         const char* contentId = status["media"]["contentId"] | "";
-        configuredContent =
-            contentId[0] != '\0' && maintainedUrl_ == contentId;
         const int32_t mediaSessionId = status["mediaSessionId"] | -1;
+        const bool sameKnownSession =
+            mediaSessionId >= 0 &&
+            mediaSessionId == maintainedMediaSessionId_;
+        configuredContent =
+            contentId[0] != '\0' ? maintainedUrl_ == contentId
+                                 : sameKnownSession;
         if (mediaSessionId >= 0) {
           maintainedMediaSessionId_ = mediaSessionId;
         }
@@ -1042,6 +1068,8 @@ void CastClient::service() {
             static_cast<long>(mediaSessionId), contentId);
         if (strcmp(state, "PLAYING") == 0) {
           bufferingSinceMs_ = 0;
+          reassertPlay =
+              configuredContent && recoveryFailures_ > 0;
           recoveryFailures_ = 0;
           resumeAttempts_ = 0;
           active = true;
@@ -1067,6 +1095,12 @@ void CastClient::service() {
       mediaCheckRequestId_ = 0;
       mediaCheckSentMs_ = 0;
       lastMediaCheckMs_ = millis();
+      if (reassertPlay) {
+        if (!resumeMaintainedStream(false)) {
+          scheduleRecovery("Playback reassert failed");
+        }
+        return;
+      }
       if (paused) {
         const bool requested =
             configuredContent && resumeAttempts_ < 2
@@ -1679,7 +1713,8 @@ bool CastClient::waitForMediaActivity(uint32_t expectedRequestId,
                                       uint32_t timeoutMs,
                                       bool& active,
                                       bool* paused,
-                                      bool* configuredContent) {
+                                      bool* configuredContent,
+                                      bool* playing) {
   const uint32_t deadline = millis() + timeoutMs;
   active = false;
   if (paused != nullptr) {
@@ -1687,6 +1722,9 @@ bool CastClient::waitForMediaActivity(uint32_t expectedRequestId,
   }
   if (configuredContent != nullptr) {
     *configuredContent = false;
+  }
+  if (playing != nullptr) {
+    *playing = false;
   }
 
   while (!deadlineReached(deadline)) {
@@ -1730,8 +1768,7 @@ bool CastClient::waitForMediaActivity(uint32_t expectedRequestId,
     }
 
     const uint32_t responseRequestId = document["requestId"] | 0U;
-    if (responseRequestId != 0 &&
-        responseRequestId != expectedRequestId) {
+    if (responseRequestId != expectedRequestId) {
       continue;
     }
 
@@ -1747,11 +1784,15 @@ bool CastClient::waitForMediaActivity(uint32_t expectedRequestId,
         const char* extendedState =
             status["extendedStatus"]["playerState"] | "";
         const char* contentId = status["media"]["contentId"] | "";
-        if (configuredContent != nullptr) {
-          *configuredContent =
-              contentId[0] != '\0' && maintainedUrl_ == contentId;
-        }
         const int32_t mediaSessionId = status["mediaSessionId"] | -1;
+        if (configuredContent != nullptr) {
+          const bool sameKnownSession =
+              mediaSessionId >= 0 &&
+              mediaSessionId == maintainedMediaSessionId_;
+          *configuredContent =
+              contentId[0] != '\0' ? maintainedUrl_ == contentId
+                                   : sameKnownSession;
+        }
         if (mediaSessionId >= 0) {
           maintainedMediaSessionId_ = mediaSessionId;
         }
@@ -1759,6 +1800,9 @@ bool CastClient::waitForMediaActivity(uint32_t expectedRequestId,
             "MEDIA query state=%s extended=%s media_session=%ld",
             state, extendedState, static_cast<long>(mediaSessionId));
         if (strcmp(state, "PLAYING") == 0) {
+          if (playing != nullptr) {
+            *playing = true;
+          }
           bufferingSinceMs_ = 0;
           active = true;
           break;

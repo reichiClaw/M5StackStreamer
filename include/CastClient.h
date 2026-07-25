@@ -75,7 +75,8 @@ class CastClient {
                             uint32_t timeoutMs,
                             bool& active,
                             bool* paused = nullptr,
-                            bool* configuredContent = nullptr);
+                            bool* configuredContent = nullptr,
+                            bool* playing = nullptr);
   bool handleHeartbeat(const cast_protocol::Message& message);
   bool sendHeartbeatIfDue();
   bool maintainHeartbeat();
@@ -90,7 +91,7 @@ class CastClient {
   void clearMaintainedPlayback();
   void scheduleRecovery(const String& reason);
   bool loadMaintainedStream();
-  bool resumeMaintainedStream();
+  bool resumeMaintainedStream(bool trackResponse = true);
   bool recoverMaintainedPlayback();
   uint32_t nextRequestId();
   void setError(const String& message);
