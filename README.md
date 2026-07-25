@@ -19,7 +19,8 @@ http://orf-live.ors-shoutcast.at/oe3-q2a
 - Lets you select a receiver on the M5Stack display, including names containing
   `Ä`, `Ö`, `Ü`, `ä`, `ö`, `ü`, and `ß`.
 - Uses an Ö3-branded card interface with receiver and status icons, colored
-  controls, Wi-Fi state, and an animated on-air equalizer.
+  controls, Wi-Fi state, the M5Stack IP address, and an animated on-air
+  equalizer.
 - Keeps the Cast sender connected during playback, sends five-second
   heartbeats, checks media health, and automatically reconnects or reloads the
   stream after an unexpected interruption.
@@ -133,7 +134,7 @@ Only use the controller on a trusted LAN.
 Google does not publish Cast V2 as a supported embedded-controller API.
 Protocol changes in future receiver firmware could require a firmware update.
 
-If a secure Cast connection fails, the firmware retries once and displays the
+If a secure Cast connection fails, the firmware retries twice and displays the
 underlying TLS error. The complete numeric error and target address are also
 available through `pio device monitor --baud 115200`.
 
@@ -146,6 +147,30 @@ Cast session remains `PLAYING` but attached speakers become silent, remove
 their standard Bluetooth pairing while retaining the `[LE]` pairing used by
 the Marshall app; Marshall documents simultaneous Bluetooth and Auracast as a
 possible source of dropouts. Ethernet can also isolate Heddon's Wi-Fi path.
+
+## Diagnostics
+
+The M5Stack IP appears in the status-card header. Open the following address
+from another device on the same LAN:
+
+```text
+http://<M5-IP>/log
+```
+
+It returns the latest timestamped discovery, connection-stage, TLS, Cast
+request/response, Wi-Fi signal, and memory diagnostics. Passwords are never
+logged. The endpoint is intended only for a trusted LAN. To guarantee that an
+HTTP client cannot delay Cast heartbeats, web requests are serviced only while
+playback maintenance is inactive; press **START-STOP** before opening the log
+after a playback problem. For the complete live log, including ESP32 socket
+errors:
+
+```bash
+pio device monitor --baud 115200 | tee heddon.log
+```
+
+Start casting while this command is running and provide `heddon.log` when
+reporting a connection problem.
 
 ## Logo artwork
 

@@ -2,11 +2,16 @@
 
 #include <ArduinoJson.h>
 #include <WiFi.h>
+#include <errno.h>
 #include <esp_system.h>
+#include <stdlib.h>
+#include <string.h>
 
 #include <memory>
 #include <new>
 #include <vector>
+
+#include "Diagnostics.h"
 
 namespace {
 
@@ -34,6 +39,53 @@ bool deadlineReached(uint32_t deadline) {
 String jsonReason(const JsonDocument& document) {
   const char* reason = document["reason"] | "";
   return reason[0] == '\0' ? String("unknown reason") : String(reason);
+}
+
+void logCastMessage(const char* direction,
+                    const char* source,
+                    const char* destination,
+                    const char* nameSpace,
+                    const char* payload,
+                    size_t payloadLength) {
+  if (strcmp(nameSpace, kHeartbeatNamespace) == 0) {
+    return;
+  }
+
+  char type[32] = "unknown";
+  const char* typeStart = strstr(payload, "\"type\"");
+  if (typeStart != nullptr) {
+    typeStart = strchr(typeStart + 6, ':');
+    if (typeStart != nullptr) {
+      do {
+        ++typeStart;
+      } while (*typeStart == ' ' || *typeStart == '\t');
+      if (*typeStart == '"') {
+        ++typeStart;
+        const char* typeEnd = strchr(typeStart, '"');
+        if (typeEnd != nullptr) {
+          size_t typeLength = static_cast<size_t>(typeEnd - typeStart);
+          if (typeLength >= sizeof(type)) {
+            typeLength = sizeof(type) - 1;
+          }
+          memcpy(type, typeStart, typeLength);
+          type[typeLength] = '\0';
+        }
+      }
+    }
+  }
+
+  long requestId = -1;
+  const char* requestStart = strstr(payload, "\"requestId\"");
+  if (requestStart != nullptr) {
+    requestStart = strchr(requestStart + 11, ':');
+    if (requestStart != nullptr) {
+      requestId = strtol(requestStart + 1, nullptr, 10);
+    }
+  }
+  diagnostics::logf(
+      "CAST %s type=%s req=%ld src=%s dst=%s ns=%s bytes=%u",
+      direction, type, requestId, source, destination, nameSpace,
+      static_cast<unsigned int>(payloadLength));
 }
 
 }  // namespace
@@ -967,17 +1019,33 @@ const String& CastClient::lastError() const {
 bool CastClient::open(const IPAddress& address, uint16_t port) {
   String failure = "TLS connection failed";
   resetServiceReceiver();
-  for (uint8_t attempt = 0; attempt < 2; ++attempt) {
+  constexpr uint32_t retryDelaysMs[] = {1000, 3000};
+  for (uint8_t attempt = 0; attempt < 3; ++attempt) {
     client_.stop();
     client_.setInsecure();
     client_.setTimeout(10);
     client_.setHandshakeTimeout(15);
 
+    diagnostics::logf(
+        "TLS attempt=%u target=%s:%u wifi=%d rssi=%d heap=%u "
+        "largest=%u min=%u psram=%u",
+        static_cast<unsigned int>(attempt + 1),
+        address.toString().c_str(), static_cast<unsigned int>(port),
+        static_cast<int>(WiFi.status()),
+        WiFi.RSSI(), ESP.getFreeHeap(), ESP.getMaxAllocHeap(),
+        ESP.getMinFreeHeap(), ESP.getFreePsram());
+    const uint32_t startedAt = millis();
+    errno = 0;
     if (client_.connect(address, port)) {
       lastPingMs_ = millis();
+      diagnostics::logf("TLS connected attempt=%u elapsed=%lums fd=%d",
+                        static_cast<unsigned int>(attempt + 1),
+                        static_cast<unsigned long>(millis() - startedAt),
+                        client_.fd());
       return true;
     }
 
+    const int socketErrno = errno;
     char errorText[96] = {};
     const int errorCode = client_.lastError(errorText, sizeof(errorText));
     if (errorCode != 0) {
@@ -988,20 +1056,36 @@ bool CastClient::open(const IPAddress& address, uint16_t port) {
       }
     }
 
-    Serial.printf("Cast TLS attempt %u to %s:%u failed (%d: %s)\n",
-                  static_cast<unsigned int>(attempt + 1),
-                  address.toString().c_str(), port, errorCode, errorText);
-    if (attempt == 0) {
+    diagnostics::logf(
+        "TLS failed attempt=%u elapsed=%lums mbed=%d text=\"%s\" "
+        "errno_snapshot=%d \"%s\"",
+        static_cast<unsigned int>(attempt + 1),
+        static_cast<unsigned long>(millis() - startedAt), errorCode,
+        errorText, socketErrno,
+        socketErrno == 0 ? "" : strerror(socketErrno));
+    if (attempt < 2) {
       report("Retrying secure Cast connection");
-      delay(400);
+      delay(retryDelaysMs[attempt]);
     }
   }
 
+  WiFiClient infoProbe;
+  const uint32_t probeStartedAt = millis();
+  const bool infoPortOpen = infoProbe.connect(address, 8008, 2000);
+  diagnostics::logf("Probe target=%s:8008 result=%s elapsed=%lums",
+                    address.toString().c_str(),
+                    infoPortOpen ? "open" : "closed",
+                    static_cast<unsigned long>(millis() - probeStartedAt));
+  infoProbe.stop();
   setError(failure);
   return false;
 }
 
 void CastClient::close() {
+  if (client_.fd() >= 0) {
+    diagnostics::logf("TLS close fd=%d maintaining=%s", client_.fd(),
+                      maintainPlayback_ ? "yes" : "no");
+  }
   client_.stop();
   resetServiceReceiver();
 }
@@ -1009,6 +1093,8 @@ void CastClient::close() {
 bool CastClient::sendPayload(const String& destinationId,
                              const char* nameSpace,
                              const String& payload) {
+  logCastMessage("TX", kSourceId, destinationId.c_str(), nameSpace,
+                 payload.c_str(), payload.length());
   std::vector<uint8_t> encoded;
   if (!cast_protocol::encodeStringMessage(
           kSourceId, destinationId.c_str(), nameSpace,
@@ -1148,6 +1234,9 @@ CastClient::ReceiveResult CastClient::receiveMessage(
     setError("Invalid Cast protocol message");
     return ReceiveResult::kError;
   }
+  logCastMessage("RX", message.sourceId.c_str(),
+                 message.destinationId.c_str(), message.nameSpace.c_str(),
+                 message.payloadUtf8.c_str(), message.payloadUtf8.size());
   return ReceiveResult::kMessage;
 }
 
@@ -1219,6 +1308,11 @@ CastClient::ReceiveResult CastClient::receiveMessageNonBlocking(
         setError("Invalid Cast protocol message");
         return ReceiveResult::kError;
       }
+      logCastMessage("RX", message.sourceId.c_str(),
+                     message.destinationId.c_str(),
+                     message.nameSpace.c_str(),
+                     message.payloadUtf8.c_str(),
+                     message.payloadUtf8.size());
       return ReceiveResult::kMessage;
     }
   }
@@ -1608,7 +1702,7 @@ void CastClient::addErrorContext(const char* operation) {
 }
 
 void CastClient::report(const String& status) const {
-  Serial.println(status);
+  diagnostics::logf("STATE %s", status.c_str());
   if (statusCallback_ != nullptr) {
     statusCallback_(status);
   }

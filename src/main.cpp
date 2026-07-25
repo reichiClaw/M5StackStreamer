@@ -3,12 +3,15 @@
 #include <M5Unified.h>
 #include <WiFi.h>
 #include <WiFiManager.h>
+#include <WebServer.h>
+#include <esp_system.h>
 
 #include <algorithm>
 #include <vector>
 
 #include "AppConfig.h"
 #include "CastClient.h"
+#include "Diagnostics.h"
 #include "Oe3Logo.h"
 #include "TextEncoding.h"
 
@@ -49,12 +52,39 @@ uint32_t lastScanMs = 0;
 uint32_t wifiLostAtMs = 0;
 uint32_t lastEqualizerDrawMs = 0;
 UiPlaybackState playbackState = UiPlaybackState::kUnknown;
+bool diagnosticsServerStarted = false;
+IPAddress displayedLocalIp;
 
 void updateCastStatus(const String& message);
 
 CastClient& castController() {
   static CastClient controller(updateCastStatus);
   return controller;
+}
+
+WebServer& diagnosticsServer() {
+  static WebServer server(80);
+  return server;
+}
+
+void startDiagnosticsServer() {
+  if (diagnosticsServerStarted) {
+    return;
+  }
+  WebServer& server = diagnosticsServer();
+  server.on("/", HTTP_GET, []() {
+    diagnosticsServer().send(
+        200, "text/plain; charset=utf-8",
+        String("M5Stack OE3 diagnostics\n\n") + diagnostics::snapshot());
+  });
+  server.on("/log", HTTP_GET, []() {
+    diagnosticsServer().send(200, "text/plain; charset=utf-8",
+                             diagnostics::snapshot());
+  });
+  server.begin();
+  diagnosticsServerStarted = true;
+  diagnostics::logf("HTTP diagnostics started url=http://%s/log",
+                    WiFi.localIP().toString().c_str());
 }
 
 String shortened(const String& value, size_t maximumCharacters) {
@@ -286,7 +316,8 @@ void drawMainScreen() {
     M5.Display.setCursor(109, 69);
     M5.Display.printf("%s:%u",
                       devices[selectedDevice].address.toString().c_str(),
-                      devices[selectedDevice].port);
+                      static_cast<unsigned int>(
+                          devices[selectedDevice].port));
     M5.Display.fillRoundRect(269, 64, 36, 16, 8, kOe3Blue);
     M5.Display.setTextColor(TFT_WHITE, kOe3Blue);
     M5.Display.setCursor(272, 69);
@@ -300,6 +331,12 @@ void drawMainScreen() {
   M5.Display.setTextColor(kMuted, kCard);
   M5.Display.setCursor(109, 106);
   M5.Display.print("STATUS");
+  M5.Display.setCursor(198, 106);
+  if (WiFi.status() == WL_CONNECTED) {
+    M5.Display.printf("M5 %s", WiFi.localIP().toString().c_str());
+  } else {
+    M5.Display.print("M5 OFFLINE");
+  }
   drawStatusIcon(120, 146, statusVisual());
 
   M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
@@ -315,6 +352,8 @@ void drawMainScreen() {
   drawButton(216, kOe3Blue, "C", "SCAN");
   M5.Display.endWrite();
   lastEqualizerDrawMs = millis();
+  displayedLocalIp =
+      WiFi.status() == WL_CONNECTED ? WiFi.localIP() : IPAddress();
 }
 
 void updateCastStatus(const String& message) {
@@ -382,7 +421,8 @@ void createDeviceIdentity() {
   char buffer[24];
   snprintf(buffer, sizeof(buffer), "M5Cast-%06X", chipId);
   accessPointName = buffer;
-  snprintf(buffer, sizeof(buffer), "cast-%06X", chipId);
+  snprintf(buffer, sizeof(buffer), "cast-%08X",
+           static_cast<unsigned int>(esp_random()));
   accessPointPassword = buffer;
   snprintf(buffer, sizeof(buffer), "m5cast-%06x", chipId);
   hostName = buffer;
@@ -395,7 +435,7 @@ bool connectWifi() {
   WiFiManager manager;
   manager.setConnectTimeout(20);
   manager.setAPCallback(drawConfigPortal);
-  manager.setDebugOutput(true);
+  manager.setDebugOutput(false);
 
   statusText = "Connecting to WiFi";
   drawMainScreen();
@@ -474,6 +514,13 @@ void scanCastDevices() {
     if (friendlyName.isEmpty()) {
       friendlyName = address.toString();
     }
+    diagnostics::logf(
+        "MDNS cast name=\"%s\" id=%s model=\"%s\" addr=%s:%u ca=%s "
+        "ve=%s",
+        friendlyName.c_str(), deviceId.c_str(),
+        MDNS.txt(index, "md").c_str(), address.toString().c_str(),
+        static_cast<unsigned int>(port),
+        MDNS.txt(index, "ca").c_str(), MDNS.txt(index, "ve").c_str());
     discovered.push_back({friendlyName, deviceId, address, port});
   }
 
@@ -505,12 +552,8 @@ void scanCastDevices() {
   }
   drawMainScreen();
 
-  Serial.printf("Cast discovery returned %d service(s), kept %u\n",
-                resultCount, static_cast<unsigned int>(devices.size()));
-  for (const CastDevice& item : devices) {
-    Serial.printf("  %s at %s:%u\n", item.name.c_str(),
-                  item.address.toString().c_str(), item.port);
-  }
+  diagnostics::logf("MDNS scan results=%d retained=%u", resultCount,
+                    static_cast<unsigned int>(devices.size()));
 }
 
 void resetWifiIfRequested() {
@@ -548,6 +591,10 @@ void toggleSelectedStream() {
   }
 
   const CastDevice device = devices[selectedDevice];
+  diagnostics::logf("BUTTON toggle name=\"%s\" id=%s target=%s:%u",
+                    device.name.c_str(), device.id.c_str(),
+                    device.address.toString().c_str(),
+                    static_cast<unsigned int>(device.port));
   const CastClient::ToggleResult result =
       castClient.toggle(device.address, device.port, device.id.c_str(),
                         app_config::kStreamUrl,
@@ -570,6 +617,7 @@ void handleWifiConnection() {
     if (wifiLostAtMs == 0) {
       wifiLostAtMs = millis() == 0 ? 1 : millis();
       statusText = "WiFi lost; reconnecting...";
+      diagnostics::logf("WIFI lost status=%d", static_cast<int>(WiFi.status()));
       drawMainScreen();
       WiFi.reconnect();
     } else if (millis() - wifiLostAtMs >=
@@ -577,11 +625,13 @@ void handleWifiConnection() {
       if (castController().isMaintainingPlayback()) {
         wifiLostAtMs = millis();
         statusText = "WiFi unavailable; still retrying";
+        diagnostics::logf("WIFI still unavailable; playback recovery retained");
         drawMainScreen();
         WiFi.reconnect();
         return;
       }
       statusText = "WiFi unavailable; restarting";
+      diagnostics::logf("WIFI unavailable; restarting M5Stack");
       drawMainScreen();
       delay(1000);
       ESP.restart();
@@ -592,6 +642,8 @@ void handleWifiConnection() {
   if (wifiLostAtMs != 0) {
     wifiLostAtMs = 0;
     statusText = "WiFi reconnected";
+    diagnostics::logf("WIFI reconnected ip=%s rssi=%d",
+                      WiFi.localIP().toString().c_str(), WiFi.RSSI());
     drawMainScreen();
     startMdns();
     scanCastDevices();
@@ -613,6 +665,10 @@ void setup() {
   M5.Display.setTextWrap(false);
 
   createDeviceIdentity();
+  diagnostics::logf(
+      "BOOT build=%s %s heap=%u psram=%u reset=%d", __DATE__, __TIME__,
+      ESP.getFreeHeap(), ESP.getFreePsram(),
+      static_cast<int>(esp_reset_reason()));
   resetWifiIfRequested();
   drawMainScreen();
 
@@ -624,7 +680,11 @@ void setup() {
   }
 
   statusText = String("Connected to ") + WiFi.SSID();
+  diagnostics::logf("WIFI connected ip=%s rssi=%d channel=%d",
+                    WiFi.localIP().toString().c_str(), WiFi.RSSI(),
+                    WiFi.channel());
   drawMainScreen();
+  startDiagnosticsServer();
   startMdns();
   scanCastDevices();
 }
@@ -632,6 +692,10 @@ void setup() {
 void loop() {
   M5.update();
   handleWifiConnection();
+  if (WiFi.status() == WL_CONNECTED &&
+      WiFi.localIP() != displayedLocalIp) {
+    drawMainScreen();
+  }
   const bool middleButton =
       M5.BtnB.wasClicked() || M5.BtnB.wasHold();
   bool middleButtonHandled = false;
@@ -666,6 +730,10 @@ void loop() {
     }
   }
   castController().service();
+  if (diagnosticsServerStarted && WiFi.status() == WL_CONNECTED &&
+      !castController().isMaintainingPlayback()) {
+    diagnosticsServer().handleClient();
+  }
 
   if (playbackState == UiPlaybackState::kPlaying &&
       millis() - lastEqualizerDrawMs >= 180) {
