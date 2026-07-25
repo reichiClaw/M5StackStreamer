@@ -24,6 +24,15 @@ http://orf-live.ors-shoutcast.at/oe3-q2a
 - Keeps the Cast sender connected during playback, sends ten-second
   heartbeats, checks media health, and automatically reconnects or reloads the
   stream after an unexpected interruption.
+- Detects half-open connections: when the receiver sends nothing for
+  35 seconds, the session is torn down and recovered instead of idling
+  silently forever.
+- Reacts immediately to receiver-initiated media status broadcasts (stream
+  finished, paused, or failed) instead of waiting for the next health poll.
+- Disables ESP32 Wi-Fi modem power save while running, which removes the
+  latency bursts that destabilize long-lived Cast TLS connections.
+- Remembers active playback in flash and automatically resumes OE3 after a
+  power loss or reboot.
 - Launches the Default Media Receiver and loads OE3 as a live `audio/mpeg`
   source.
 - Uses the middle button to start or stop the maintained playback session.
@@ -120,11 +129,16 @@ phone, a VPN-only address, or `localhost` will not work.
 8. While playing, it retains the TLS and application channels, polls media
    status every 15 seconds, and uses bounded-backoff recovery when needed.
 
-Heartbeats are transmitted every ten seconds, but a missing `PONG` alone does
-not tear down playback. Media-status timeouts retain the existing session and
-retry later; socket write/framing failures and explicit channel closure remain
-authoritative. This accommodates embedded Cast implementations that use
-receiver-originated heartbeats.
+Heartbeats are transmitted every ten seconds, but a single missing `PONG`
+does not tear down playback. Media-status timeouts retain the existing
+session and retry later; socket write/framing failures and explicit channel
+closure remain authoritative. This accommodates embedded Cast implementations
+that use receiver-originated heartbeats. However, when *nothing* arrives from
+the receiver for 35 seconds — roughly three missed heartbeat windows — the
+connection is considered half-open and recovery starts. Recovery reconnects
+with a single TLS attempt per cycle and exponential backoff from 2 seconds up
+to 2 minutes, so the buttons, display, and diagnostics stay responsive while
+a receiver is offline.
 
 Cast receivers use device-generated certificates on the local Cast port, so
 the firmware intentionally accepts the receiver's self-signed TLS certificate.
@@ -134,13 +148,16 @@ Only use the controller on a trusted LAN.
 Google does not publish Cast V2 as a supported embedded-controller API.
 Protocol changes in future receiver firmware could require a firmware update.
 
-If a secure Cast connection fails, the firmware retries twice and displays the
-underlying TLS error. The complete numeric error and target address are also
-available through `pio device monitor --baud 115200`.
+If a user-initiated secure Cast connection fails, the firmware retries twice
+and displays the underlying TLS error. The complete numeric error and target
+address are also available through `pio device monitor --baud 115200`.
 
 Automatic recovery remains enabled until the middle **START-STOP** button is
 used. Stopping playback from the receiver or another controller may therefore
-cause OE3 to restart on the next health check.
+cause OE3 to restart on the next health check. The playing/stopped decision
+is also stored in flash: after a power loss the firmware reconnects and
+resumes OE3 on the last receiver by itself. Press **START-STOP** to stop and
+clear that stored state.
 
 For Marshall Heddon, install current firmware using the Marshall app. If the
 Cast session remains `PLAYING` but attached speakers become silent, remove
@@ -159,12 +176,12 @@ http://<M5-IP>/log
 
 It returns the latest timestamped discovery, connection-stage, TLS, Cast
 request/response, Wi-Fi signal, and memory diagnostics. Passwords are never
-logged. The endpoint is intended only for a trusted LAN. To guarantee that an
-HTTP client cannot delay Cast heartbeats, web requests are serviced only while
-playback maintenance is inactive; press **START-STOP** before opening the log
-after a playback problem. Up to 256 lines are retained when the 64 KiB PSRAM
-allocation succeeds; the internal-memory fallback retains 32 lines. The first
-line reports capacity, retained, total, and dropped line counts.
+logged. The endpoint is intended only for a trusted LAN. The log stays
+available during playback; a stalled HTTP client is dropped after two seconds
+so it cannot delay Cast heartbeats. Up to 256 lines are retained when the
+64 KiB PSRAM allocation succeeds; the internal-memory fallback retains
+32 lines. The first line reports capacity, retained, total, and dropped line
+counts.
 
 For the complete live log, including ESP32 socket errors:
 

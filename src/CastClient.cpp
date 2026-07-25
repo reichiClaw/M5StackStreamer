@@ -29,7 +29,11 @@ constexpr uint32_t kFrameCompletionTimeoutMs = 5000;
 constexpr uint32_t kMediaCheckIntervalMs = 15000;
 constexpr uint32_t kBufferingMaximumMs = 30000;
 constexpr uint32_t kRecoveryBaseDelayMs = 2000;
-constexpr uint32_t kRecoveryMaximumDelayMs = 30000;
+constexpr uint32_t kRecoveryMaximumDelayMs = 120000;
+// A healthy receiver answers the 10-second PINGs and usually sends its own
+// heartbeats every 5 seconds. Three missed PONG windows plus margin means the
+// TCP connection is half-open even though the socket still looks connected.
+constexpr uint32_t kInboundSilenceTimeoutMs = 35000;
 
 bool deadlineReached(uint32_t deadline) {
   return static_cast<int32_t>(millis() - deadline) >= 0;
@@ -94,6 +98,7 @@ CastClient::CastClient(StatusCallback statusCallback)
       sourceId_("sender-0"),
       requestId_((esp_random() & 0x3fffffffU) + 1),
       lastPingMs_(0),
+      lastInboundMs_(0),
       heartbeatSent_(0),
       heartbeatPongs_(0),
       heartbeatPeerPings_(0),
@@ -218,6 +223,10 @@ bool CastClient::play(const IPAddress& address,
       break;
     }
     report("Sending OE3 stream");
+    // DMR media session IDs restart at small integers per application
+    // session; drop any stale ID before the fresh LOAD assigns a new one.
+    maintainedMediaSessionId_ = -1;
+    maintainedMediaApplicationSessionId_ = application.sessionId;
     if (!sendPayload(application.transportId, kMediaNamespace, payload)) {
       break;
     }
@@ -226,7 +235,7 @@ bool CastClient::play(const IPAddress& address,
       break;
     }
 
-    report("OE3 is playing");
+    report("OE3 is playing", StatusKind::kPlaying);
     succeeded = true;
   } while (false);
 
@@ -291,7 +300,7 @@ bool CastClient::stop(const IPAddress& address, uint16_t port) {
       break;
     }
     if (statusResult == AppWaitResult::kNotFound) {
-      report("Stream is already stopped");
+      report("Stream is already stopped", StatusKind::kStopped);
       succeeded = true;
       break;
     }
@@ -320,7 +329,7 @@ bool CastClient::stop(const IPAddress& address, uint16_t port) {
     const AppWaitResult stopResult =
         waitForReceiverApplication(stopRequestId, 10000, true, application);
     if (stopResult == AppWaitResult::kNotFound) {
-      report("Stream is stopped");
+      report("Stream is stopped", StatusKind::kStopped);
       succeeded = true;
     } else if (stopResult == AppWaitResult::kFound) {
       setError("Receiver kept the media session open");
@@ -454,7 +463,7 @@ CastClient::ToggleResult CastClient::toggle(const IPAddress& address,
       const AppWaitResult stopResult =
           waitForReceiverApplication(stopRequestId, 10000, true, application);
       if (stopResult == AppWaitResult::kNotFound) {
-        report("Stream is stopped");
+        report("Stream is stopped", StatusKind::kStopped);
         result = ToggleResult::kStopped;
       } else if (stopResult == AppWaitResult::kFound) {
         setError("Receiver kept the media session open");
@@ -530,6 +539,8 @@ CastClient::ToggleResult CastClient::toggle(const IPAddress& address,
       break;
     }
     report("Sending OE3 stream");
+    maintainedMediaSessionId_ = -1;
+    maintainedMediaApplicationSessionId_ = application.sessionId;
     if (!sendPayload(application.transportId, kMediaNamespace, payload)) {
       addErrorContext("Stream load request");
       break;
@@ -539,7 +550,7 @@ CastClient::ToggleResult CastClient::toggle(const IPAddress& address,
       break;
     }
 
-    report("OE3 is playing");
+    report("OE3 is playing", StatusKind::kPlaying);
     result = ToggleResult::kStarted;
   } while (false);
 
@@ -591,7 +602,7 @@ CastClient::ToggleResult CastClient::stopMaintainedPlayback() {
 
   clearMaintainedPlayback();
   if (stopped) {
-    report("Stream is stopped");
+    report("Stream is stopped", StatusKind::kStopped);
     return ToggleResult::kStopped;
   }
   if (lastError_.isEmpty()) {
@@ -670,8 +681,8 @@ void CastClient::scheduleRecovery(const String& reason) {
   bufferingSinceMs_ = 0;
 
   uint8_t shift = recoveryFailures_;
-  if (shift > 4) {
-    shift = 4;
+  if (shift > 6) {
+    shift = 6;
   }
   uint32_t delayMs = kRecoveryBaseDelayMs << shift;
   if (delayMs > kRecoveryMaximumDelayMs) {
@@ -683,7 +694,8 @@ void CastClient::scheduleRecovery(const String& reason) {
   recoveryScheduled_ = true;
   recoveryScheduledAtMs_ = millis();
   recoveryDelayMs_ = delayMs;
-  report(reason + "; retrying in " + String(delayMs / 1000) + "s");
+  report(reason + "; retrying in " + String(delayMs / 1000) + "s",
+         StatusKind::kError);
 }
 
 bool CastClient::loadMaintainedStream() {
@@ -759,8 +771,8 @@ bool CastClient::resumeMaintainedStream(bool trackResponse) {
     return false;
   }
 
-  report(trackResponse ? "Resuming OE3 stream"
-                       : "Reasserting OE3 playback");
+  report(trackResponse ? "Resuming OE3 stream" : "Reasserting OE3 playback",
+         trackResponse ? StatusKind::kBusy : StatusKind::kPlaying);
   if (!sendPayload(maintainedApplication_.transportId, kMediaNamespace,
                    payload)) {
     return false;
@@ -789,7 +801,10 @@ bool CastClient::recoverMaintainedPlayback() {
   lastError_ = "";
   ReceiverApplication application;
 
-  if (!open(maintainedAddress_, maintainedPort_)) {
+  // A single TLS attempt per recovery cycle keeps the Arduino loop (UI,
+  // Wi-Fi handling, diagnostics) responsive; the backoff scheduler in
+  // service() provides the retries.
+  if (!open(maintainedAddress_, maintainedPort_, 1)) {
     return false;
   }
 
@@ -873,7 +888,8 @@ bool CastClient::recoverMaintainedPlayback() {
                                 &configuredContent, &playing)) {
         if (client_.connected() &&
             lastError_ == "Receiver did not report media status") {
-          report("Media state delayed; keeping existing playback");
+          report("Media state delayed; keeping existing playback",
+                 StatusKind::kInfo);
           mediaCheckPending_ = true;
           mediaCheckRequestId_ = mediaRequestId;
           mediaCheckSentMs_ = millis();
@@ -905,7 +921,7 @@ bool CastClient::recoverMaintainedPlayback() {
         mediaCheckPending_ = false;
         mediaCheckRequestId_ = 0;
         mediaCheckSentMs_ = 0;
-        report("Cast connection restored");
+        report("Cast connection restored", StatusKind::kInfo);
         succeeded = true;
         break;
       }
@@ -920,8 +936,140 @@ bool CastClient::recoverMaintainedPlayback() {
   return succeeded;
 }
 
+bool CastClient::handleBroadcastMediaStatus(const JsonDocument& mediaStatus) {
+  const char* type = mediaStatus["type"] | "";
+  if (strcmp(type, "MEDIA_STATUS") != 0 ||
+      !mediaStatus["status"].is<JsonArrayConst>()) {
+    return true;
+  }
+
+  const bool sameAppSession =
+      maintainedMediaApplicationSessionId_ ==
+      maintainedApplication_.sessionId;
+  JsonArrayConst statuses = mediaStatus["status"].as<JsonArrayConst>();
+  for (JsonObjectConst status : statuses) {
+    const char* state = status["playerState"] | "";
+    const char* extendedState =
+        status["extendedStatus"]["playerState"] | "";
+    const char* idleReason = status["idleReason"] | "";
+    const char* contentId = status["media"]["contentId"] | "";
+    const int32_t mediaSessionId = status["mediaSessionId"] | -1;
+    const bool sameKnownSession =
+        mediaSessionId >= 0 && sameAppSession &&
+        mediaSessionId == maintainedMediaSessionId_;
+    const bool configuredContent =
+        contentId[0] != '\0' ? maintainedUrl_ == contentId
+                             : sameKnownSession;
+    if (!configuredContent) {
+      continue;
+    }
+    if (mediaSessionId >= 0) {
+      maintainedMediaSessionId_ = mediaSessionId;
+      maintainedMediaApplicationSessionId_ =
+          maintainedApplication_.sessionId;
+    }
+    diagnostics::logf(
+        "MEDIA broadcast state=%s extended=%s idle=%s media_session=%ld "
+        "content=\"%s\"",
+        state, extendedState, idleReason,
+        static_cast<long>(mediaSessionId), contentId);
+
+    if (strcmp(state, "PLAYING") == 0) {
+      bufferingSinceMs_ = 0;
+      recoveryFailures_ = 0;
+      resumeAttempts_ = 0;
+      lastMediaCheckMs_ = millis();
+      return true;
+    }
+    if (mediaCheckPending_) {
+      // A solicited check or resume is in flight; its response decides.
+      return true;
+    }
+    if (strcmp(state, "PAUSED") == 0) {
+      const bool requested = resumeAttempts_ < 2 ? resumeMaintainedStream()
+                                                 : loadMaintainedStream();
+      if (!requested) {
+        scheduleRecovery("Stream resume failed");
+        return false;
+      }
+      return true;
+    }
+    if (strcmp(state, "BUFFERING") == 0 ||
+        (strcmp(state, "IDLE") == 0 &&
+         strcmp(extendedState, "LOADING") == 0)) {
+      if (bufferingSinceMs_ == 0) {
+        bufferingSinceMs_ = millis() == 0 ? 1 : millis();
+      }
+      if (millis() - bufferingSinceMs_ >= kBufferingMaximumMs &&
+          !loadMaintainedStream()) {
+        scheduleRecovery("Stream restart failed");
+        return false;
+      }
+      return true;
+    }
+    if (strcmp(state, "IDLE") == 0 &&
+        (strcmp(idleReason, "FINISHED") == 0 ||
+         strcmp(idleReason, "ERROR") == 0 ||
+         strcmp(idleReason, "CANCELLED") == 0)) {
+      // The live stream dropped on the receiver side; reload it right away
+      // instead of waiting for the next health poll. INTERRUPTED is
+      // deliberately ignored because our own LOAD emits it for the
+      // superseded session.
+      if (!loadMaintainedStream()) {
+        scheduleRecovery("Stream restart failed");
+        return false;
+      }
+      return true;
+    }
+    return true;
+  }
+  return true;
+}
+
+bool CastClient::resumePlayback(const IPAddress& address,
+                                uint16_t port,
+                                const char* deviceId,
+                                const char* url,
+                                const char* contentType,
+                                const char* title) {
+  lastError_ = "";
+  maintainedAddress_ = address;
+  maintainedPort_ = port;
+  maintainedDeviceId_ = deviceId == nullptr ? "" : deviceId;
+  maintainedUrl_ = url;
+  maintainedContentType_ = contentType;
+  maintainedTitle_ = title;
+  maintainedApplication_ = ReceiverApplication();
+  maintainedMediaSessionId_ = -1;
+  maintainedMediaApplicationSessionId_ = "";
+  maintainPlayback_ = true;
+  recoveryFailures_ = 0;
+  recoveryScheduled_ = false;
+  recoveryScheduledAtMs_ = 0;
+  recoveryDelayMs_ = 0;
+  lastMediaCheckMs_ = millis();
+  mediaCheckPending_ = false;
+  mediaCheckRequestId_ = 0;
+  mediaCheckSentMs_ = 0;
+  resumeAttempts_ = 0;
+  bufferingSinceMs_ = 0;
+
+  report("Resuming OE3 playback");
+  if (recoverMaintainedPlayback()) {
+    return true;
+  }
+  // Maintenance stays enabled so service() keeps retrying; this covers the
+  // common power-blip case where the receiver is also still booting.
+  scheduleRecovery("Playback resume failed");
+  return false;
+}
+
 bool CastClient::isMaintainingPlayback() const {
   return maintainPlayback_;
+}
+
+bool CastClient::hasHealthyConnection() {
+  return maintainPlayback_ && !recoveryScheduled_ && client_.connected();
 }
 
 bool CastClient::cancelMaintenance() {
@@ -935,7 +1083,7 @@ bool CastClient::cancelMaintenance() {
   maintainPlayback_ = false;
   close();
   clearMaintainedPlayback();
-  report("Playback recovery cancelled");
+  report("Playback recovery cancelled", StatusKind::kStopped);
   return true;
 }
 
@@ -1014,19 +1162,28 @@ void CastClient::service() {
       continue;
     }
 
-    if (message.nameSpace == kMediaNamespace && message.payloadType == 0 &&
-        mediaCheckPending_) {
+    if (message.nameSpace == kMediaNamespace && message.payloadType == 0) {
       JsonDocument mediaStatus;
       if (deserializeJson(mediaStatus, message.payloadUtf8)) {
+        if (!mediaCheckPending_) {
+          continue;
+        }
         mediaCheckPending_ = false;
         mediaCheckRequestId_ = 0;
         mediaCheckSentMs_ = 0;
         lastMediaCheckMs_ = millis();
-        report("Invalid media status; keeping Cast session");
+        report("Invalid media status; keeping Cast session",
+               StatusKind::kInfo);
         continue;
       }
       const uint32_t responseRequestId = mediaStatus["requestId"] | 0U;
-      if (responseRequestId != mediaCheckRequestId_) {
+      if (!mediaCheckPending_ || responseRequestId != mediaCheckRequestId_) {
+        // Receiver-initiated broadcast (or a response to a request that has
+        // already timed out): react to state changes without waiting for
+        // the next 15-second poll.
+        if (!handleBroadcastMediaStatus(mediaStatus)) {
+          return;
+        }
         continue;
       }
 
@@ -1045,7 +1202,8 @@ void CastClient::service() {
           }
           continue;
         }
-        report("Media status rejected; keeping Cast session");
+        report("Media status rejected; keeping Cast session",
+               StatusKind::kInfo);
         continue;
       }
 
@@ -1063,7 +1221,9 @@ void CastClient::service() {
         const int32_t mediaSessionId = status["mediaSessionId"] | -1;
         const bool sameKnownSession =
             mediaSessionId >= 0 &&
-            mediaSessionId == maintainedMediaSessionId_;
+            mediaSessionId == maintainedMediaSessionId_ &&
+            maintainedMediaApplicationSessionId_ ==
+                maintainedApplication_.sessionId;
         configuredContent =
             contentId[0] != '\0' ? maintainedUrl_ == contentId
                                  : sameKnownSession;
@@ -1133,6 +1293,15 @@ void CastClient::service() {
     }
   }
 
+  // Heartbeats are sent above, but nothing so far verified that anything
+  // ever comes back. A receiver whose Cast daemon wedged can leave the TCP
+  // connection half-open; without this check the session would stay in a
+  // silent zombie state forever.
+  if (millis() - lastInboundMs_ >= kInboundSilenceTimeoutMs) {
+    scheduleRecovery("Cast receiver went silent");
+    return;
+  }
+
   if (mediaCheckPending_) {
     if (millis() - mediaCheckSentMs_ >= 5000) {
       const bool resumeWasPending = resumeAttempts_ > 0;
@@ -1145,7 +1314,8 @@ void CastClient::service() {
           scheduleRecovery("Resume status timed out");
         }
       } else {
-        report("Media status delayed; keeping Cast session");
+        report("Media status delayed; keeping Cast session",
+               StatusKind::kInfo);
       }
     }
     return;
@@ -1171,7 +1341,7 @@ void CastClient::service() {
   String payload;
   if (mediaRequest.overflowed() ||
       serializeJson(mediaRequest, payload) == 0) {
-    report("Could not build media health check");
+    report("Could not build media health check", StatusKind::kError);
     return;
   }
   if (!sendPayload(maintainedApplication_.transportId, kMediaNamespace,
@@ -1188,11 +1358,17 @@ const String& CastClient::lastError() const {
   return lastError_;
 }
 
-bool CastClient::open(const IPAddress& address, uint16_t port) {
+bool CastClient::open(const IPAddress& address, uint16_t port,
+                      uint8_t attempts) {
   String failure = "TLS connection failed";
   resetServiceReceiver();
   constexpr uint32_t retryDelaysMs[] = {1000, 3000};
-  for (uint8_t attempt = 0; attempt < 3; ++attempt) {
+  if (attempts < 1) {
+    attempts = 1;
+  } else if (attempts > 3) {
+    attempts = 3;
+  }
+  for (uint8_t attempt = 0; attempt < attempts; ++attempt) {
     client_.stop();
     client_.setInsecure();
     client_.setHandshakeTimeout(15);
@@ -1211,6 +1387,7 @@ bool CastClient::open(const IPAddress& address, uint16_t port) {
       client_.setTimeout(10);
       sourceId_ = "sender-0";
       lastPingMs_ = millis();
+      lastInboundMs_ = millis();
       heartbeatSent_ = 0;
       heartbeatPongs_ = 0;
       heartbeatPeerPings_ = 0;
@@ -1240,7 +1417,7 @@ bool CastClient::open(const IPAddress& address, uint16_t port) {
         static_cast<unsigned long>(millis() - startedAt), errorCode,
         errorText, socketErrno,
         socketErrno == 0 ? "" : strerror(socketErrno));
-    if (attempt < 2) {
+    if (attempt + 1 < attempts) {
       report("Retrying secure Cast connection");
       delay(retryDelaysMs[attempt]);
     }
@@ -1411,6 +1588,7 @@ CastClient::ReceiveResult CastClient::receiveMessage(
     setError("Invalid Cast protocol message");
     return ReceiveResult::kError;
   }
+  lastInboundMs_ = millis();
   logCastMessage("RX", message.sourceId.c_str(),
                  message.destinationId.c_str(), message.nameSpace.c_str(),
                  message.payloadUtf8.c_str(), message.payloadUtf8.size());
@@ -1485,6 +1663,7 @@ CastClient::ReceiveResult CastClient::receiveMessageNonBlocking(
         setError("Invalid Cast protocol message");
         return ReceiveResult::kError;
       }
+      lastInboundMs_ = millis();
       logCastMessage("RX", message.sourceId.c_str(),
                      message.destinationId.c_str(),
                      message.nameSpace.c_str(),
@@ -1566,7 +1745,13 @@ CastClient::AppWaitResult CastClient::waitForReceiverApplication(
 
     const char* type = document["type"] | "";
     const uint32_t responseRequestId = document["requestId"] | 0U;
-    if (responseRequestId != expectedRequestId) {
+    const bool matchesRequest = responseRequestId == expectedRequestId;
+    // While waiting for a LAUNCH, older Cast-built-in receivers announce the
+    // started application in a broadcast RECEIVER_STATUS (requestId 0)
+    // instead of the direct response. Accept those too.
+    const bool acceptBroadcast =
+        !finishOnMissingStatus && responseRequestId == 0;
+    if (!matchesRequest && !acceptBroadcast) {
       continue;
     }
 
@@ -1581,17 +1766,21 @@ CastClient::AppWaitResult CastClient::waitForReceiverApplication(
         application.transportId = item["transportId"] | "";
         application.sessionId = item["sessionId"] | "";
         if (application.transportId.isEmpty()) {
+          if (!matchesRequest) {
+            continue;
+          }
           setError("Receiver supplied no transport ID");
           return AppWaitResult::kError;
         }
         return AppWaitResult::kFound;
       }
 
-      if (finishOnMissingStatus) {
+      if (matchesRequest && finishOnMissingStatus) {
         return AppWaitResult::kNotFound;
       }
-    } else if (strcmp(type, "LAUNCH_ERROR") == 0 ||
-               strcmp(type, "INVALID_REQUEST") == 0) {
+    } else if (matchesRequest &&
+               (strcmp(type, "LAUNCH_ERROR") == 0 ||
+                strcmp(type, "INVALID_REQUEST") == 0)) {
       setError(String("Receiver request failed: ") + jsonReason(document));
       return AppWaitResult::kError;
     }
@@ -1800,7 +1989,9 @@ bool CastClient::waitForMediaActivity(uint32_t expectedRequestId,
         if (configuredContent != nullptr) {
           const bool sameKnownSession =
               mediaSessionId >= 0 &&
-              mediaSessionId == maintainedMediaSessionId_;
+              mediaSessionId == maintainedMediaSessionId_ &&
+              maintainedMediaApplicationSessionId_ ==
+                  maintainedApplication_.sessionId;
           *configuredContent =
               contentId[0] != '\0' ? maintainedUrl_ == contentId
                                    : sameKnownSession;
@@ -1915,7 +2106,7 @@ uint32_t CastClient::nextRequestId() {
 
 void CastClient::setError(const String& message) {
   lastError_ = message;
-  report(String("Error: ") + message);
+  report(String("Error: ") + message, StatusKind::kError);
 }
 
 void CastClient::addErrorContext(const char* operation) {
@@ -1928,9 +2119,9 @@ void CastClient::addErrorContext(const char* operation) {
   setError(contextualError);
 }
 
-void CastClient::report(const String& status) const {
+void CastClient::report(const String& status, StatusKind kind) const {
   diagnostics::logf("STATE %s", status.c_str());
   if (statusCallback_ != nullptr) {
-    statusCallback_(status);
+    statusCallback_(status, kind);
   }
 }

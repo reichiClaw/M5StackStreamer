@@ -1,13 +1,18 @@
 #pragma once
 
 #include <Arduino.h>
+#include <ArduinoJson.h>
 #include <WiFiClientSecure.h>
 
 #include "CastProtocol.h"
 
 class CastClient {
  public:
-  using StatusCallback = void (*)(const String& status);
+  // Machine-readable classification of a status message. The UI must not
+  // parse status strings; it derives icons and playback state from this kind.
+  enum class StatusKind : uint8_t { kInfo, kBusy, kPlaying, kStopped, kError };
+
+  using StatusCallback = void (*)(const String& status, StatusKind kind);
 
   enum class ToggleResult { kStarted, kStopped, kError };
 
@@ -34,10 +39,24 @@ class CastClient {
                       const char* contentType,
                       const char* title);
 
+  // Adopts (or starts) OE3 playback on the target without toggling: an
+  // already playing configured stream is joined, anything else is resumed or
+  // loaded. Enables playback maintenance even when the first attempt fails,
+  // so service() keeps retrying. Intended for auto-resume after a reboot.
+  bool resumePlayback(const IPAddress& address,
+                      uint16_t port,
+                      const char* deviceId,
+                      const char* url,
+                      const char* contentType,
+                      const char* title);
+
   // Services heartbeats and health checks for a stream started by toggle().
   // Call frequently from the Arduino loop.
   void service();
   bool isMaintainingPlayback() const;
+  // True while a maintained session has an established, non-recovering TLS
+  // connection. Used to skip disruptive periodic work (e.g. mDNS scans).
+  bool hasHealthyConnection();
   bool cancelMaintenance();
   void updateDiscoveredEndpoint(const char* deviceId,
                                 const IPAddress& address,
@@ -54,7 +73,7 @@ class CastClient {
   enum class ReceiveResult { kMessage, kNoData, kError };
   enum class AppWaitResult { kFound, kNotFound, kTimeout, kError };
 
-  bool open(const IPAddress& address, uint16_t port);
+  bool open(const IPAddress& address, uint16_t port, uint8_t attempts = 3);
   void close();
   bool sendPayload(const String& destinationId,
                    const char* nameSpace,
@@ -80,6 +99,9 @@ class CastClient {
   bool handleHeartbeat(const cast_protocol::Message& message);
   bool sendHeartbeatIfDue();
   bool maintainHeartbeat();
+  // Reacts to receiver-initiated MEDIA_STATUS broadcasts for the maintained
+  // stream. Returns false when recovery was scheduled.
+  bool handleBroadcastMediaStatus(const JsonDocument& mediaStatus);
   ToggleResult stopMaintainedPlayback();
   void rememberPlayback(const IPAddress& address,
                         uint16_t port,
@@ -96,7 +118,7 @@ class CastClient {
   uint32_t nextRequestId();
   void setError(const String& message);
   void addErrorContext(const char* operation);
-  void report(const String& status) const;
+  void report(const String& status, StatusKind kind = StatusKind::kBusy) const;
 
   WiFiClientSecure client_;
   StatusCallback statusCallback_;
@@ -104,6 +126,7 @@ class CastClient {
   String sourceId_;
   uint32_t requestId_;
   uint32_t lastPingMs_;
+  uint32_t lastInboundMs_;
   uint32_t heartbeatSent_;
   uint32_t heartbeatPongs_;
   uint32_t heartbeatPeerPings_;

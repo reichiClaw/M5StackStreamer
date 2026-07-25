@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <ESPmDNS.h>
 #include <M5Unified.h>
+#include <Preferences.h>
 #include <WiFi.h>
 #include <WiFiManager.h>
 #include <WebServer.h>
@@ -41,9 +42,12 @@ constexpr uint16_t kOe3Red = rgb565(228, 28, 42);
 constexpr uint16_t kGreen = rgb565(36, 201, 123);
 constexpr uint16_t kAmber = rgb565(245, 166, 35);
 
+constexpr char kPreferencesNamespace[] = "m5cast";
+
 std::vector<CastDevice> devices;
 size_t selectedDevice = 0;
 String statusText = "Starting";
+StatusVisual statusVisualState = StatusVisual::kBusy;
 String accessPointName;
 String accessPointPassword;
 String hostName;
@@ -55,7 +59,14 @@ UiPlaybackState playbackState = UiPlaybackState::kUnknown;
 bool diagnosticsServerStarted = false;
 IPAddress displayedLocalIp;
 
-void updateCastStatus(const String& message);
+void updateCastStatus(const String& message, CastClient::StatusKind kind);
+void drawMainScreen();
+
+void setStatus(const String& text, StatusVisual visual) {
+  statusText = text;
+  statusVisualState = visual;
+  drawMainScreen();
+}
 
 CastClient& castController() {
   static CastClient controller(updateCastStatus);
@@ -142,38 +153,6 @@ void drawOe3Logo(int32_t x, int32_t y) {
                kOe3Blue);
   drawLogoRuns(x, y, oe3_logo::kRedRuns, oe3_logo::kRedRunCount,
                kOe3Red);
-}
-
-StatusVisual statusVisual() {
-  String normalized = statusText;
-  normalized.toLowerCase();
-  if (normalized.indexOf("error") >= 0 ||
-      normalized.indexOf("failed") >= 0 ||
-      normalized.indexOf("could not") >= 0 ||
-      normalized.indexOf("did not") >= 0 ||
-      normalized.indexOf("unavailable") >= 0 ||
-      normalized.indexOf("not connected") >= 0 ||
-      normalized.indexOf("no cast receiver") >= 0 ||
-      normalized.indexOf("no receiver") >= 0) {
-    return StatusVisual::kError;
-  }
-  if (normalized.indexOf("playing") >= 0) {
-    return StatusVisual::kPlaying;
-  }
-  if (normalized.indexOf("stopped") >= 0) {
-    return StatusVisual::kStopped;
-  }
-  if (normalized.indexOf("connecting") >= 0 ||
-      normalized.indexOf("checking") >= 0 ||
-      normalized.indexOf("scanning") >= 0 ||
-      normalized.indexOf("starting") >= 0 ||
-      normalized.indexOf("opening") >= 0 ||
-      normalized.indexOf("sending") >= 0 ||
-      normalized.indexOf("buffering") >= 0 ||
-      normalized.indexOf("stopping") >= 0) {
-    return StatusVisual::kBusy;
-  }
-  return StatusVisual::kReady;
 }
 
 void drawStatusIcon(int32_t x, int32_t y, StatusVisual visual) {
@@ -340,7 +319,7 @@ void drawMainScreen() {
   } else {
     M5.Display.print("M5 OFFLINE");
   }
-  drawStatusIcon(120, 146, statusVisual());
+  drawStatusIcon(120, 146, statusVisualState);
 
   M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
   M5.Display.setAttribute(lgfx::UTF8_SWITCH, false);
@@ -359,15 +338,28 @@ void drawMainScreen() {
       WiFi.status() == WL_CONNECTED ? WiFi.localIP() : IPAddress();
 }
 
-void updateCastStatus(const String& message) {
+void updateCastStatus(const String& message, CastClient::StatusKind kind) {
   statusText = message;
-  String normalized = message;
-  normalized.toLowerCase();
-  if (normalized.indexOf("is playing") >= 0) {
-    playbackState = UiPlaybackState::kPlaying;
-  } else if (normalized.indexOf("stream is stopped") >= 0 ||
-             normalized.indexOf("already stopped") >= 0) {
-    playbackState = UiPlaybackState::kStopped;
+  switch (kind) {
+    case CastClient::StatusKind::kPlaying:
+      playbackState = UiPlaybackState::kPlaying;
+      statusVisualState = StatusVisual::kPlaying;
+      break;
+    case CastClient::StatusKind::kStopped:
+      playbackState = UiPlaybackState::kStopped;
+      statusVisualState = StatusVisual::kStopped;
+      break;
+    case CastClient::StatusKind::kError:
+      statusVisualState = StatusVisual::kError;
+      break;
+    case CastClient::StatusKind::kBusy:
+      statusVisualState = StatusVisual::kBusy;
+      break;
+    default:
+      statusVisualState = playbackState == UiPlaybackState::kPlaying
+                              ? StatusVisual::kPlaying
+                              : StatusVisual::kReady;
+      break;
   }
   drawMainScreen();
 }
@@ -440,8 +432,7 @@ bool connectWifi() {
   manager.setAPCallback(drawConfigPortal);
   manager.setDebugOutput(false);
 
-  statusText = "Connecting to WiFi";
-  drawMainScreen();
+  setStatus("Connecting to WiFi", StatusVisual::kBusy);
   return manager.autoConnect(accessPointName.c_str(),
                              accessPointPassword.c_str());
 }
@@ -454,16 +445,14 @@ bool startMdns() {
 
   mdnsStarted = MDNS.begin(hostName.c_str());
   if (!mdnsStarted) {
-    statusText = "Could not start mDNS";
-    drawMainScreen();
+    setStatus("Could not start mDNS", StatusVisual::kError);
   }
   return mdnsStarted;
 }
 
 void scanCastDevices() {
   if (WiFi.status() != WL_CONNECTED) {
-    statusText = "WiFi is not connected";
-    drawMainScreen();
+    setStatus("WiFi is not connected", StatusVisual::kError);
     return;
   }
   if (!mdnsStarted && !startMdns()) {
@@ -478,8 +467,7 @@ void scanCastDevices() {
     previousId = devices[selectedDevice].id;
   }
 
-  statusText = "Scanning for Cast receivers...";
-  drawMainScreen();
+  setStatus("Scanning for Cast receivers...", StatusVisual::kBusy);
   const int resultCount = MDNS.queryService("googlecast", "tcp");
 
   std::vector<CastDevice> discovered;
@@ -549,11 +537,11 @@ void scanCastDevices() {
 
   lastScanMs = millis();
   if (devices.empty()) {
-    statusText = "No Cast receiver found. Press SCAN.";
+    setStatus("No Cast receiver found. Press SCAN.", StatusVisual::kError);
   } else {
-    statusText = String(devices.size()) + " receiver(s) found";
+    setStatus(String(devices.size()) + " receiver(s) found",
+              StatusVisual::kReady);
   }
-  drawMainScreen();
 
   diagnostics::logf("MDNS scan results=%d retained=%u", resultCount,
                     static_cast<unsigned int>(devices.size()));
@@ -579,17 +567,81 @@ void resetWifiIfRequested() {
   ESP.restart();
 }
 
+void saveResumeState(const CastDevice& device) {
+  Preferences preferences;
+  if (!preferences.begin(kPreferencesNamespace, false)) {
+    return;
+  }
+  preferences.putBool("playing", true);
+  preferences.putString("devid", device.id);
+  preferences.putString("devname", device.name);
+  preferences.putUInt("addr", static_cast<uint32_t>(device.address));
+  preferences.putUShort("port", device.port);
+  preferences.end();
+}
+
+void clearResumeState() {
+  Preferences preferences;
+  if (!preferences.begin(kPreferencesNamespace, false)) {
+    return;
+  }
+  preferences.putBool("playing", false);
+  preferences.end();
+}
+
+// Restores OE3 after a reboot (e.g. power loss) when playback was active
+// before. Prefers the freshly discovered endpoint for the saved device ID and
+// falls back to the last known address.
+void resumeSavedPlayback() {
+  Preferences preferences;
+  if (!preferences.begin(kPreferencesNamespace, true)) {
+    return;
+  }
+  const bool playing = preferences.getBool("playing", false);
+  const String deviceId = preferences.getString("devid", "");
+  String deviceName = preferences.getString("devname", "");
+  uint32_t rawAddress = preferences.getUInt("addr", 0);
+  uint16_t port = preferences.getUShort("port", 0);
+  preferences.end();
+  if (!playing || rawAddress == 0 || port == 0) {
+    return;
+  }
+
+  IPAddress address(rawAddress);
+  for (size_t index = 0; index < devices.size(); ++index) {
+    if (!deviceId.isEmpty() && devices[index].id == deviceId) {
+      address = devices[index].address;
+      port = devices[index].port;
+      deviceName = devices[index].name;
+      selectedDevice = index;
+      break;
+    }
+  }
+
+  diagnostics::logf("RESUME saved device=\"%s\" id=%s target=%s:%u",
+                    deviceName.c_str(), deviceId.c_str(),
+                    address.toString().c_str(),
+                    static_cast<unsigned int>(port));
+  setStatus(String("Resuming OE3 on ") + deviceName, StatusVisual::kBusy);
+  if (castController().resumePlayback(address, port, deviceId.c_str(),
+                                      app_config::kStreamUrl,
+                                      app_config::kStreamContentType,
+                                      app_config::kStreamTitle)) {
+    playbackState = UiPlaybackState::kPlaying;
+    drawMainScreen();
+  }
+}
+
 void toggleSelectedStream() {
   CastClient& castClient = castController();
   if (devices.empty()) {
     if (castClient.cancelMaintenance()) {
+      clearResumeState();
       playbackState = UiPlaybackState::kStopped;
-      statusText = "Playback recovery stopped";
-      drawMainScreen();
+      setStatus("Playback recovery stopped", StatusVisual::kStopped);
       return;
     }
-    statusText = "No receiver selected. Press SCAN.";
-    drawMainScreen();
+    setStatus("No receiver selected. Press SCAN.", StatusVisual::kError);
     return;
   }
 
@@ -604,38 +656,39 @@ void toggleSelectedStream() {
                         app_config::kStreamContentType,
                         app_config::kStreamTitle);
   if (result == CastClient::ToggleResult::kStarted) {
+    saveResumeState(device);
     playbackState = UiPlaybackState::kPlaying;
-    statusText = String("Playing OE3 on ") + device.name;
+    setStatus(String("Playing OE3 on ") + device.name,
+              StatusVisual::kPlaying);
   } else if (result == CastClient::ToggleResult::kStopped) {
+    clearResumeState();
     playbackState = UiPlaybackState::kStopped;
-    statusText = String("Stopped stream on ") + device.name;
+    setStatus(String("Stopped stream on ") + device.name,
+              StatusVisual::kStopped);
   } else {
-    statusText = String("Toggle failed: ") + castClient.lastError();
+    setStatus(String("Toggle failed: ") + castClient.lastError(),
+              StatusVisual::kError);
   }
-  drawMainScreen();
 }
 
 void handleWifiConnection() {
   if (WiFi.status() != WL_CONNECTED) {
     if (wifiLostAtMs == 0) {
       wifiLostAtMs = millis() == 0 ? 1 : millis();
-      statusText = "WiFi lost; reconnecting...";
+      setStatus("WiFi lost; reconnecting...", StatusVisual::kError);
       diagnostics::logf("WIFI lost status=%d", static_cast<int>(WiFi.status()));
-      drawMainScreen();
       WiFi.reconnect();
     } else if (millis() - wifiLostAtMs >=
                app_config::kWifiReconnectTimeoutMs) {
       if (castController().isMaintainingPlayback()) {
         wifiLostAtMs = millis();
-        statusText = "WiFi unavailable; still retrying";
+        setStatus("WiFi unavailable; still retrying", StatusVisual::kError);
         diagnostics::logf("WIFI still unavailable; playback recovery retained");
-        drawMainScreen();
         WiFi.reconnect();
         return;
       }
-      statusText = "WiFi unavailable; restarting";
+      setStatus("WiFi unavailable; restarting", StatusVisual::kError);
       diagnostics::logf("WIFI unavailable; restarting M5Stack");
-      drawMainScreen();
       delay(1000);
       ESP.restart();
     }
@@ -644,10 +697,9 @@ void handleWifiConnection() {
 
   if (wifiLostAtMs != 0) {
     wifiLostAtMs = 0;
-    statusText = "WiFi reconnected";
+    setStatus("WiFi reconnected", StatusVisual::kReady);
     diagnostics::logf("WIFI reconnected ip=%s rssi=%d",
                       WiFi.localIP().toString().c_str(), WiFi.RSSI());
-    drawMainScreen();
     startMdns();
     scanCastDevices();
   }
@@ -677,20 +729,23 @@ void setup() {
   drawMainScreen();
 
   if (!connectWifi()) {
-    statusText = "WiFi setup failed; restarting";
-    drawMainScreen();
+    setStatus("WiFi setup failed; restarting", StatusVisual::kError);
     delay(3000);
     ESP.restart();
   }
 
-  statusText = String("Connected to ") + WiFi.SSID();
-  diagnostics::logf("WIFI connected ip=%s rssi=%d channel=%d",
+  // The ESP32 enables modem power save by default, which adds latency
+  // bursts and destabilizes the long-lived Cast TLS connection.
+  WiFi.setSleep(false);
+
+  setStatus(String("Connected to ") + WiFi.SSID(), StatusVisual::kReady);
+  diagnostics::logf("WIFI connected ip=%s rssi=%d channel=%d sleep=off",
                     WiFi.localIP().toString().c_str(), WiFi.RSSI(),
                     WiFi.channel());
-  drawMainScreen();
   startDiagnosticsServer();
   startMdns();
   scanCastDevices();
+  resumeSavedPlayback();
 }
 
 void loop() {
@@ -707,16 +762,16 @@ void loop() {
   if (middleButton && WiFi.status() != WL_CONNECTED &&
       castController().cancelMaintenance()) {
     middleButtonHandled = true;
+    clearResumeState();
     playbackState = UiPlaybackState::kStopped;
-    statusText = "Playback recovery stopped";
-    drawMainScreen();
+    setStatus("Playback recovery stopped", StatusVisual::kStopped);
   }
 
   if (WiFi.status() == WL_CONNECTED) {
     if (M5.BtnA.wasPressed() && !devices.empty()) {
       selectedDevice = (selectedDevice + 1) % devices.size();
-      statusText = String("Selected ") + devices[selectedDevice].name;
-      drawMainScreen();
+      setStatus(String("Selected ") + devices[selectedDevice].name,
+                StatusVisual::kReady);
     }
     if (middleButton && !middleButtonHandled) {
       toggleSelectedStream();
@@ -729,13 +784,16 @@ void loop() {
     const uint32_t scanInterval =
         devices.empty() ? app_config::kEmptyScanIntervalMs
                         : app_config::kPeriodicScanIntervalMs;
-    if (millis() - lastScanMs >= scanInterval) {
+    // MDNS.queryService blocks the loop for seconds; skip the periodic
+    // rescan while a maintained Cast session is connected and healthy. Once
+    // recovery starts, scanning resumes so a changed receiver IP is found.
+    if (millis() - lastScanMs >= scanInterval &&
+        !castController().hasHealthyConnection()) {
       scanCastDevices();
     }
   }
   castController().service();
-  if (diagnosticsServerStarted && WiFi.status() == WL_CONNECTED &&
-      !castController().isMaintainingPlayback()) {
+  if (diagnosticsServerStarted && WiFi.status() == WL_CONNECTED) {
     diagnosticsServer().handleClient();
   }
 

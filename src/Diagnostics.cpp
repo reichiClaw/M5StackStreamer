@@ -43,6 +43,11 @@ size_t writeHeader(char* buffer, size_t bufferLength) {
   return length > 0 ? static_cast<size_t>(length) : 0;
 }
 
+// The log is also served while a Cast session is maintained; the stall
+// budget must stay well below the 10-second heartbeat interval so a slow
+// HTTP client cannot starve the Cast connection.
+constexpr uint32_t kWriteStallTimeoutMs = 2000;
+
 bool writeAll(Print& output, const uint8_t* data, size_t length) {
   size_t offset = 0;
   uint32_t lastProgressAt = millis();
@@ -53,7 +58,7 @@ bool writeAll(Print& output, const uint8_t* data, size_t length) {
       lastProgressAt = millis();
       continue;
     }
-    if (millis() - lastProgressAt >= 10000) {
+    if (millis() - lastProgressAt >= kWriteStallTimeoutMs) {
       return false;
     }
     delay(1);
