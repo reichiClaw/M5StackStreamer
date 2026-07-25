@@ -117,6 +117,7 @@ class CastClient {
   String maintainedTitle_;
   ReceiverApplication maintainedApplication_;
   int32_t maintainedMediaSessionId_;
+  String maintainedMediaApplicationSessionId_;
   uint32_t lastMediaCheckMs_;
   bool mediaCheckPending_;
   uint32_t mediaCheckRequestId_;

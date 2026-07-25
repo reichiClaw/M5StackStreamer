@@ -24,7 +24,7 @@ constexpr char kHeartbeatNamespace[] =
 constexpr char kReceiverNamespace[] = "urn:x-cast:com.google.cast.receiver";
 constexpr char kMediaNamespace[] = "urn:x-cast:com.google.cast.media";
 
-constexpr uint32_t kHeartbeatIntervalMs = 5000;
+constexpr uint32_t kHeartbeatIntervalMs = 10000;
 constexpr uint32_t kFrameCompletionTimeoutMs = 5000;
 constexpr uint32_t kMediaCheckIntervalMs = 15000;
 constexpr uint32_t kBufferingMaximumMs = 30000;
@@ -615,6 +615,7 @@ void CastClient::rememberPlayback(
   maintainedContentType_ = contentType;
   maintainedTitle_ = title;
   maintainedApplication_ = application;
+  maintainedMediaApplicationSessionId_ = application.sessionId;
   maintainPlayback_ = true;
   recoveryFailures_ = 0;
   recoveryScheduled_ = false;
@@ -638,6 +639,7 @@ void CastClient::clearMaintainedPlayback() {
   maintainedTitle_ = "";
   maintainedApplication_ = ReceiverApplication();
   maintainedMediaSessionId_ = -1;
+  maintainedMediaApplicationSessionId_ = "";
   lastMediaCheckMs_ = 0;
   mediaCheckPending_ = false;
   mediaCheckRequestId_ = 0;
@@ -661,7 +663,6 @@ void CastClient::scheduleRecovery(const String& reason) {
       static_cast<unsigned int>(recoveryFailures_));
   close();
   maintainedApplication_ = ReceiverApplication();
-  maintainedMediaSessionId_ = -1;
   mediaCheckPending_ = false;
   mediaCheckRequestId_ = 0;
   mediaCheckSentMs_ = 0;
@@ -717,6 +718,8 @@ bool CastClient::loadMaintainedStream() {
 
   report("Restarting OE3 stream");
   maintainedMediaSessionId_ = -1;
+  maintainedMediaApplicationSessionId_ =
+      maintainedApplication_.sessionId;
   if (!sendPayload(maintainedApplication_.transportId, kMediaNamespace,
                    payload)) {
     return false;
@@ -841,6 +844,10 @@ bool CastClient::recoverMaintainedPlayback() {
                      F("{\"type\":\"CONNECT\",\"origin\":{}}"))) {
       break;
     }
+    if (maintainedMediaApplicationSessionId_ != application.sessionId) {
+      maintainedMediaSessionId_ = -1;
+      maintainedMediaApplicationSessionId_ = application.sessionId;
+    }
     maintainedApplication_ = application;
 
     if (!launched) {
@@ -885,8 +892,10 @@ bool CastClient::recoverMaintainedPlayback() {
       }
       if (active) {
         if (playing && configuredContent) {
-          recoveryFailures_ = 0;
           succeeded = resumeMaintainedStream(false);
+          if (succeeded) {
+            recoveryFailures_ = 0;
+          }
           break;
         }
         recoveryScheduled_ = false;
@@ -1058,8 +1067,10 @@ void CastClient::service() {
         configuredContent =
             contentId[0] != '\0' ? maintainedUrl_ == contentId
                                  : sameKnownSession;
-        if (mediaSessionId >= 0) {
+        if (mediaSessionId >= 0 && configuredContent) {
           maintainedMediaSessionId_ = mediaSessionId;
+          maintainedMediaApplicationSessionId_ =
+              maintainedApplication_.sessionId;
         }
         diagnostics::logf(
             "MEDIA state=%s extended=%s idle=%s media_session=%ld "
@@ -1070,7 +1081,9 @@ void CastClient::service() {
           bufferingSinceMs_ = 0;
           reassertPlay =
               configuredContent && recoveryFailures_ > 0;
-          recoveryFailures_ = 0;
+          if (!reassertPlay) {
+            recoveryFailures_ = 0;
+          }
           resumeAttempts_ = 0;
           active = true;
           break;
@@ -1098,6 +1111,8 @@ void CastClient::service() {
       if (reassertPlay) {
         if (!resumeMaintainedStream(false)) {
           scheduleRecovery("Playback reassert failed");
+        } else {
+          recoveryFailures_ = 0;
         }
         return;
       }
@@ -1194,10 +1209,7 @@ bool CastClient::open(const IPAddress& address, uint16_t port) {
     errno = 0;
     if (client_.connect(address, port, 10000)) {
       client_.setTimeout(10);
-      char senderId[24];
-      snprintf(senderId, sizeof(senderId), "sender-%08X",
-               static_cast<unsigned int>(esp_random()));
-      sourceId_ = senderId;
+      sourceId_ = "sender-0";
       lastPingMs_ = millis();
       heartbeatSent_ = 0;
       heartbeatPongs_ = 0;
@@ -1793,8 +1805,11 @@ bool CastClient::waitForMediaActivity(uint32_t expectedRequestId,
               contentId[0] != '\0' ? maintainedUrl_ == contentId
                                    : sameKnownSession;
         }
-        if (mediaSessionId >= 0) {
+        if (mediaSessionId >= 0 &&
+            (configuredContent == nullptr || *configuredContent)) {
           maintainedMediaSessionId_ = mediaSessionId;
+          maintainedMediaApplicationSessionId_ =
+              maintainedApplication_.sessionId;
         }
         diagnostics::logf(
             "MEDIA query state=%s extended=%s media_session=%ld",
@@ -1853,13 +1868,18 @@ bool CastClient::handleHeartbeat(const cast_protocol::Message& message) {
   const char* type = document["type"] | "";
   if (strcmp(type, "PONG") == 0) {
     ++heartbeatPongs_;
+    diagnostics::logf("HEARTBEAT PONG src=%s dst=%s",
+                      message.sourceId.c_str(),
+                      message.destinationId.c_str());
   }
   if (strcmp(type, "PING") == 0) {
     ++heartbeatPeerPings_;
-    const String destination =
-        message.sourceId.empty() ? String(kPlatformDestinationId)
-                                 : String(message.sourceId.c_str());
-    if (!sendPayload(destination, kHeartbeatNamespace,
+    diagnostics::logf(
+        "HEARTBEAT peer PING src=%s dst=%s; PONG src=%s dst=%s",
+                      message.sourceId.c_str(),
+                      message.destinationId.c_str(),
+        sourceId_.c_str(), kPlatformDestinationId);
+    if (!sendPayload(kPlatformDestinationId, kHeartbeatNamespace,
                      F("{\"type\":\"PONG\"}"))) {
       return false;
     }

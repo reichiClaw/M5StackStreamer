@@ -21,7 +21,7 @@ http://orf-live.ors-shoutcast.at/oe3-q2a
 - Uses an Ö3-branded card interface with receiver and status icons, colored
   controls, Wi-Fi state, the M5Stack IP address, and an animated on-air
   equalizer.
-- Keeps the Cast sender connected during playback, sends five-second
+- Keeps the Cast sender connected during playback, sends ten-second
   heartbeats, checks media health, and automatically reconnects or reloads the
   stream after an unexpected interruption.
 - Launches the Default Media Receiver and loads OE3 as a live `audio/mpeg`
@@ -120,7 +120,7 @@ phone, a VPN-only address, or `localhost` will not work.
 8. While playing, it retains the TLS and application channels, polls media
    status every 15 seconds, and uses bounded-backoff recovery when needed.
 
-Heartbeats are transmitted every five seconds, but a missing `PONG` alone does
+Heartbeats are transmitted every ten seconds, but a missing `PONG` alone does
 not tear down playback. Media-status timeouts retain the existing session and
 retry later; socket write/framing failures and explicit channel closure remain
 authoritative. This accommodates embedded Cast implementations that use
