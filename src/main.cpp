@@ -67,20 +67,23 @@ WebServer& diagnosticsServer() {
   return server;
 }
 
+void sendDiagnosticsLog() {
+  WebServer& server = diagnosticsServer();
+  server.setContentLength(diagnostics::contentLength());
+  server.send(200, "text/plain; charset=utf-8", "");
+  WiFiClient client = server.client();
+  if (!diagnostics::writeTo(client)) {
+    client.stop();
+  }
+}
+
 void startDiagnosticsServer() {
   if (diagnosticsServerStarted) {
     return;
   }
   WebServer& server = diagnosticsServer();
-  server.on("/", HTTP_GET, []() {
-    diagnosticsServer().send(
-        200, "text/plain; charset=utf-8",
-        String("M5Stack OE3 diagnostics\n\n") + diagnostics::snapshot());
-  });
-  server.on("/log", HTTP_GET, []() {
-    diagnosticsServer().send(200, "text/plain; charset=utf-8",
-                             diagnostics::snapshot());
-  });
+  server.on("/", HTTP_GET, sendDiagnosticsLog);
+  server.on("/log", HTTP_GET, sendDiagnosticsLog);
   server.begin();
   diagnosticsServerStarted = true;
   diagnostics::logf("HTTP diagnostics started url=http://%s/log",
@@ -663,6 +666,7 @@ void setup() {
   M5.Display.setRotation(1);
   M5.Display.setBrightness(128);
   M5.Display.setTextWrap(false);
+  diagnostics::begin();
 
   createDeviceIdentity();
   diagnostics::logf(

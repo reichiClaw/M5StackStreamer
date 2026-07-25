@@ -162,15 +162,19 @@ request/response, Wi-Fi signal, and memory diagnostics. Passwords are never
 logged. The endpoint is intended only for a trusted LAN. To guarantee that an
 HTTP client cannot delay Cast heartbeats, web requests are serviced only while
 playback maintenance is inactive; press **START-STOP** before opening the log
-after a playback problem. For the complete live log, including ESP32 socket
-errors:
+after a playback problem. Up to 256 lines are retained when the 64 KiB PSRAM
+allocation succeeds; the internal-memory fallback retains 32 lines. The first
+line reports capacity, retained, total, and dropped line counts.
+
+For the complete live log, including ESP32 socket errors:
 
 ```bash
 pio device monitor --baud 115200 | tee heddon.log
 ```
 
-Start casting while this command is running and provide `heddon.log` when
-reporting a connection problem.
+Wait until the terminal says it is connected, reset the M5Stack so boot events
+are captured, then start casting. Quit with `Ctrl+C` and provide `heddon.log`
+when reporting a connection problem.
 
 ## Logo artwork
 
