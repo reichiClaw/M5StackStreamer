@@ -27,6 +27,7 @@ struct CastDevice {
 
 enum class UiPlaybackState { kUnknown, kPlaying, kStopped };
 enum class StatusVisual { kReady, kBusy, kPlaying, kStopped, kError };
+enum class InternetStatus { kUnknown, kOnline, kOffline };
 
 constexpr uint16_t rgb565(uint8_t red, uint8_t green, uint8_t blue) {
   return static_cast<uint16_t>(((red & 0xf8) << 8) |
@@ -58,6 +59,11 @@ uint32_t lastEqualizerDrawMs = 0;
 UiPlaybackState playbackState = UiPlaybackState::kUnknown;
 bool diagnosticsServerStarted = false;
 IPAddress displayedLocalIp;
+InternetStatus internetStatus = InternetStatus::kUnknown;
+uint32_t lastInternetCheckMs = 0;
+IPAddress internetProbeAddress;
+uint32_t internetProbeResolvedMs = 0;
+bool resumePending = false;
 
 void updateCastStatus(const String& message, CastClient::StatusKind kind);
 void drawMainScreen();
@@ -251,6 +257,21 @@ void drawMainScreen() {
   } else {
     M5.Display.print("OFFLINE");
   }
+
+  uint16_t internetColor = kAmber;
+  const char* internetLabel = "CHECKING";
+  if (WiFi.status() != WL_CONNECTED ||
+      internetStatus == InternetStatus::kOffline) {
+    internetColor = kOe3Red;
+    internetLabel = "NO INTERNET";
+  } else if (internetStatus == InternetStatus::kOnline) {
+    internetColor = kGreen;
+    internetLabel = "INTERNET";
+  }
+  M5.Display.fillCircle(15, 100, 3, internetColor);
+  M5.Display.setTextColor(kMuted, kCard);
+  M5.Display.setCursor(24, 97);
+  M5.Display.print(internetLabel);
   M5.Display.drawFastHLine(13, 106, 72, kCardBorder);
 
   const bool isPlaying = playbackState == UiPlaybackState::kPlaying;
@@ -362,6 +383,68 @@ void updateCastStatus(const String& message, CastClient::StatusKind kind) {
       break;
   }
   drawMainScreen();
+}
+
+// Checks whether the OE3 stream host is reachable. The resolved address is
+// cached because a DNS lookup with a dead uplink can block for many seconds,
+// which must never happen while a Cast session depends on timely heartbeats;
+// the TCP probe itself is bounded by kInternetProbeTimeoutMs.
+bool probeInternet() {
+  const bool cacheEmpty = internetProbeAddress == IPAddress();
+  const bool cacheStale =
+      cacheEmpty || millis() - internetProbeResolvedMs >=
+                        app_config::kInternetDnsRefreshMs;
+  if (cacheStale &&
+      (cacheEmpty || !castController().isMaintainingPlayback())) {
+    IPAddress resolved;
+    if (WiFi.hostByName(app_config::kInternetProbeHost, resolved) == 1 &&
+        resolved != IPAddress()) {
+      internetProbeAddress = resolved;
+      internetProbeResolvedMs = millis();
+    } else if (cacheEmpty) {
+      return false;
+    }
+  }
+
+  WiFiClient probe;
+  const bool reachable =
+      probe.connect(internetProbeAddress, app_config::kInternetProbePort,
+                    app_config::kInternetProbeTimeoutMs);
+  probe.stop();
+  return reachable;
+}
+
+void setInternetStatus(InternetStatus next) {
+  if (internetStatus == next) {
+    return;
+  }
+  internetStatus = next;
+  diagnostics::logf("NET internet=%s",
+                    next == InternetStatus::kOnline
+                        ? "online"
+                        : next == InternetStatus::kOffline ? "offline"
+                                                           : "unknown");
+  drawMainScreen();
+}
+
+void serviceInternetMonitor() {
+  if (WiFi.status() != WL_CONNECTED) {
+    lastInternetCheckMs = 0;  // Probe immediately after Wi-Fi returns.
+    setInternetStatus(InternetStatus::kOffline);
+    return;
+  }
+
+  const uint32_t interval =
+      internetStatus == InternetStatus::kOnline
+          ? app_config::kInternetCheckOnlineIntervalMs
+          : app_config::kInternetCheckOfflineIntervalMs;
+  if (lastInternetCheckMs != 0 &&
+      millis() - lastInternetCheckMs < interval) {
+    return;
+  }
+  lastInternetCheckMs = millis() == 0 ? 1 : millis();
+  setInternetStatus(probeInternet() ? InternetStatus::kOnline
+                                    : InternetStatus::kOffline);
 }
 
 void drawConfigPortal(WiFiManager*) {
@@ -634,6 +717,7 @@ void resumeSavedPlayback() {
 
 void toggleSelectedStream() {
   CastClient& castClient = castController();
+  resumePending = false;  // Manual control supersedes boot auto-resume.
   if (devices.empty()) {
     if (castClient.cancelMaintenance()) {
       clearResumeState();
@@ -643,6 +727,20 @@ void toggleSelectedStream() {
     }
     setStatus("No receiver selected. Press SCAN.", StatusVisual::kError);
     return;
+  }
+
+  // Stopping a maintained session must always work, but starting a stream
+  // is pointless without internet. Probe freshly so a stale status can
+  // neither block nor wrongly allow the start.
+  if (!castClient.isMaintainingPlayback()) {
+    lastInternetCheckMs = millis() == 0 ? 1 : millis();
+    const bool online = probeInternet();
+    setInternetStatus(online ? InternetStatus::kOnline
+                             : InternetStatus::kOffline);
+    if (!online) {
+      setStatus("No internet connection", StatusVisual::kError);
+      return;
+    }
   }
 
   const CastDevice device = devices[selectedDevice];
@@ -745,7 +843,9 @@ void setup() {
   startDiagnosticsServer();
   startMdns();
   scanCastDevices();
-  resumeSavedPlayback();
+  // Auto-resume runs from loop() once the internet monitor confirms the
+  // uplink; casting OE3 into a dead uplink would only produce load errors.
+  resumePending = true;
 }
 
 void loop() {
@@ -793,6 +893,12 @@ void loop() {
     }
   }
   castController().service();
+  serviceInternetMonitor();
+  if (resumePending && WiFi.status() == WL_CONNECTED &&
+      internetStatus == InternetStatus::kOnline) {
+    resumePending = false;
+    resumeSavedPlayback();
+  }
   if (diagnosticsServerStarted && WiFi.status() == WL_CONNECTED) {
     diagnosticsServer().handleClient();
   }

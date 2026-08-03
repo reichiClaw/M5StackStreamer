@@ -33,6 +33,11 @@ http://orf-live.ors-shoutcast.at/oe3-q2a
   latency bursts that destabilize long-lived Cast TLS connections.
 - Remembers active playback in flash and automatically resumes OE3 after a
   power loss or reboot.
+- Monitors internet connectivity by probing the OE3 stream host (DNS plus a
+  bounded TCP connect) and shows INTERNET / NO INTERNET / CHECKING on the
+  display. Starting a stream is refused while the internet is unreachable,
+  and the boot auto-resume waits until the uplink is confirmed. Stopping
+  always works, since it only needs the LAN.
 - Launches the Default Media Receiver and loads OE3 as a live `audio/mpeg`
   source.
 - Uses the middle button to start or stop the maintained playback session.
