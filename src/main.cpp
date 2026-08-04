@@ -756,8 +756,18 @@ void toggleSelectedStream() {
   if (result == CastClient::ToggleResult::kStarted) {
     saveResumeState(device);
     playbackState = UiPlaybackState::kPlaying;
-    setStatus(String("Playing OE3 on ") + device.name,
-              StatusVisual::kPlaying);
+    String text = String("Playing OE3 on ") + device.name;
+    if (castClient.receiverMuted()) {
+      text += " - receiver is MUTED!";
+    } else if (castClient.receiverVolumeKnown()) {
+      const int volumePercent = castClient.receiverVolumePercent();
+      if (volumePercent == 0) {
+        text += " - volume is 0%!";
+      } else {
+        text += String(" (vol ") + String(volumePercent) + "%)";
+      }
+    }
+    setStatus(text, StatusVisual::kPlaying);
   } else if (result == CastClient::ToggleResult::kStopped) {
     clearResumeState();
     playbackState = UiPlaybackState::kStopped;
