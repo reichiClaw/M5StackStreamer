@@ -7,7 +7,7 @@ The M5Stack is a remote control, not an audio relay. It sends this media URL to
 the Cast receiver, and the receiver downloads the MP3 stream directly:
 
 ```text
-http://orf-live.ors-shoutcast.at/oe3-q2a
+https://orf-live.ors-shoutcast.at/oe3-q2a
 ```
 
 ## Features
