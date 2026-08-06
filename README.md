@@ -38,6 +38,10 @@ https://orf-live.ors-shoutcast.at/oe3-q2a
   display. Starting a stream is refused while the internet is unreachable,
   and the boot auto-resume waits until the uplink is confirmed. Stopping
   always works, since it only needs the LAN.
+- Tracks the receiver's reported volume: the start status shows the volume
+  percentage (or a MUTED / volume-0 warning), and every volume change is
+  logged, so "playing but silent" can be told apart from a broken receiver
+  audio pipeline.
 - Launches the Default Media Receiver and loads OE3 as a live `audio/mpeg`
   source.
 - Uses the middle button to start or stop the maintained playback session.

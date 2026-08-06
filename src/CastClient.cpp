@@ -115,6 +115,9 @@ CastClient::CastClient(StatusCallback statusCallback)
       recoveryScheduledAtMs_(0),
       recoveryDelayMs_(0),
       recoveryFailures_(0),
+      volumeKnown_(false),
+      volumeMuted_(false),
+      volumeLevel_(0.0f),
       serviceHeaderBytes_(0),
       serviceFrameLength_(0),
       serviceFrameBytes_(0),
@@ -936,6 +939,49 @@ bool CastClient::recoverMaintainedPlayback() {
   return succeeded;
 }
 
+void CastClient::updateReceiverVolume(const JsonDocument& receiverStatus) {
+  JsonVariantConst volume = receiverStatus["status"]["volume"];
+  if (volume.isNull()) {
+    return;
+  }
+  const float level = volume["level"] | -1.0f;
+  if (level < 0.0f) {
+    return;
+  }
+  const bool muted = volume["muted"] | false;
+  const bool changed = !volumeKnown_ || muted != volumeMuted_ ||
+                       fabsf(level - volumeLevel_) >= 0.01f;
+  volumeKnown_ = true;
+  volumeMuted_ = muted;
+  volumeLevel_ = level;
+  if (changed) {
+    diagnostics::logf("VOLUME level=%d%% muted=%s",
+                      static_cast<int>(level * 100.0f + 0.5f),
+                      muted ? "yes" : "no");
+  }
+}
+
+bool CastClient::receiverVolumeKnown() const {
+  return volumeKnown_;
+}
+
+bool CastClient::receiverMuted() const {
+  return volumeKnown_ && volumeMuted_;
+}
+
+uint8_t CastClient::receiverVolumePercent() const {
+  if (!volumeKnown_) {
+    return 0;
+  }
+  float percent = volumeLevel_ * 100.0f + 0.5f;
+  if (percent < 0.0f) {
+    percent = 0.0f;
+  } else if (percent > 100.0f) {
+    percent = 100.0f;
+  }
+  return static_cast<uint8_t>(percent);
+}
+
 bool CastClient::handleBroadcastMediaStatus(const JsonDocument& mediaStatus) {
   const char* type = mediaStatus["type"] | "";
   if (strcmp(type, "MEDIA_STATUS") != 0 ||
@@ -1158,6 +1204,16 @@ void CastClient::service() {
           strcmp(connectionMessage["type"] | "", "CLOSE") == 0) {
         scheduleRecovery("Cast channel closed");
         return;
+      }
+      continue;
+    }
+
+    if (message.nameSpace == kReceiverNamespace && message.payloadType == 0) {
+      JsonDocument receiverStatus;
+      if (deserializeJson(receiverStatus, message.payloadUtf8) ==
+              DeserializationError::Ok &&
+          strcmp(receiverStatus["type"] | "", "RECEIVER_STATUS") == 0) {
+        updateReceiverVolume(receiverStatus);
       }
       continue;
     }
@@ -1388,6 +1444,7 @@ bool CastClient::open(const IPAddress& address, uint16_t port,
       sourceId_ = "sender-0";
       lastPingMs_ = millis();
       lastInboundMs_ = millis();
+      volumeKnown_ = false;
       heartbeatSent_ = 0;
       heartbeatPongs_ = 0;
       heartbeatPeerPings_ = 0;
@@ -1744,6 +1801,9 @@ CastClient::AppWaitResult CastClient::waitForReceiverApplication(
     }
 
     const char* type = document["type"] | "";
+    if (strcmp(type, "RECEIVER_STATUS") == 0) {
+      updateReceiverVolume(document);
+    }
     const uint32_t responseRequestId = document["requestId"] | 0U;
     const bool matchesRequest = responseRequestId == expectedRequestId;
     // While waiting for a LAUNCH, older Cast-built-in receivers announce the

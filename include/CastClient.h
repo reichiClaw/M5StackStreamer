@@ -64,6 +64,13 @@ class CastClient {
 
   const String& lastError() const;
 
+  // Receiver volume as reported by the most recent RECEIVER_STATUS on the
+  // current connection. Lets the UI distinguish "playing but muted" from a
+  // receiver whose audio pipeline is broken.
+  bool receiverVolumeKnown() const;
+  bool receiverMuted() const;
+  uint8_t receiverVolumePercent() const;
+
  private:
   struct ReceiverApplication {
     String transportId;
@@ -102,6 +109,7 @@ class CastClient {
   // Reacts to receiver-initiated MEDIA_STATUS broadcasts for the maintained
   // stream. Returns false when recovery was scheduled.
   bool handleBroadcastMediaStatus(const JsonDocument& mediaStatus);
+  void updateReceiverVolume(const JsonDocument& receiverStatus);
   ToggleResult stopMaintainedPlayback();
   void rememberPlayback(const IPAddress& address,
                         uint16_t port,
@@ -151,6 +159,10 @@ class CastClient {
   uint32_t recoveryScheduledAtMs_;
   uint32_t recoveryDelayMs_;
   uint8_t recoveryFailures_;
+
+  bool volumeKnown_;
+  bool volumeMuted_;
+  float volumeLevel_;
 
   uint8_t serviceHeader_[4];
   size_t serviceHeaderBytes_;
